@@ -1,0 +1,4 @@
+.git
+.lattice-data
+*.test
+tmp

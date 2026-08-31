@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lattice-query
+  namespace: lattice
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lattice-indexer
+  namespace: lattice

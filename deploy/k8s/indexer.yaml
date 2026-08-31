@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lattice-indexer
+  namespace: lattice
+  labels:
+    app: lattice-indexer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lattice-indexer
+  template:
+    metadata:
+      labels:
+        app: lattice-indexer
+    spec:
+      serviceAccountName: lattice-indexer
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: indexer
+          image: lattice:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/lattice-indexer"]
+          ports:
+            - name: metrics
+              containerPort: 9091
+          env:
+            - name: LATTICE_INDEXER_ADDR
+              value: ":9091"
+            - name: OPENSEARCH_URL
+              value: http://lattice-search-cluster-master:9200
+            - name: OPENSEARCH_INDEX
+              value: lattice-documents
+            - name: KAFKA_BROKERS
+              value: lattice-kafka:9092
+            - name: KAFKA_TOPIC
+              value: lattice.documents
+            - name: KAFKA_GROUP
+              value: lattice-indexer
+            - name: EMBEDDING_URL
+              value: ""
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 1, memory: 512Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lattice-indexer
+  namespace: lattice
+  labels:
+    app: lattice-indexer
+spec:
+  selector:
+    app: lattice-indexer
+  ports:
+    - name: metrics
+      port: 9091
+      targetPort: metrics

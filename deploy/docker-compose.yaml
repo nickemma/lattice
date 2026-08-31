@@ -1,0 +1,89 @@
+name: lattice
+
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v24.3.8
+    command:
+      - redpanda
+      - start
+      - --mode
+      - dev-container
+    ports:
+      - "19092:9092"
+      - "19644:9644"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health --brokers redpanda:9092 | grep -q Healthy"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  opensearch:
+    image: opensearchproject/opensearch:2.17.1
+    environment:
+      discovery.type: single-node
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      DISABLE_SECURITY_PLUGIN: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports:
+      - "19200:9200"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/ >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  redis:
+    image: redis:7.4-alpine
+    ports:
+      - "16379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  lattice-query:
+    build:
+      context: ..
+    environment:
+      LATTICE_ADDR: ":8080"
+      OPENSEARCH_URL: http://opensearch:9200
+      OPENSEARCH_INDEX: lattice-documents
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_TOPIC: lattice.documents
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8080:8080"
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+  lattice-indexer:
+    build:
+      context: ..
+    command: ["/lattice-indexer"]
+    environment:
+      OPENSEARCH_URL: http://opensearch:9200
+      OPENSEARCH_INDEX: lattice-documents
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_TOPIC: lattice.documents
+      KAFKA_GROUP: lattice-indexer
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+
+volumes:
+  redpanda-data:
+  opensearch-data:
+  redis-data:

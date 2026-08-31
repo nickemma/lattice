@@ -2,6 +2,8 @@
 
 **Companion to:** `RPD.md` (what and why). This document is *how*.
 
+**Roadmap scope:** [`docs/lattice.md`](lattice.md) is the authoritative six-phase roadmap. This document focuses on the Phase 5 search platform and Phase 6 operations; the public API is documented through OpenAPI/Swagger UI and exercised through the browser playground described in [`docs/walkthrough.md`](walkthrough.md).
+
 ---
 
 ## 1. Build vs buy

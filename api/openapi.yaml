@@ -1,0 +1,96 @@
+openapi: 3.0.3
+info:
+  title: LATTICE Search API
+  version: 0.1.0
+  description: Hybrid search with honest shard coverage and deadlines.
+servers:
+  - url: http://localhost:8080
+paths:
+  /healthz:
+    get:
+      summary: Liveness check
+      responses:
+        '200': {description: Service is alive}
+  /readyz:
+    get:
+      summary: Readiness check
+      responses:
+        '200': {description: Service is ready}
+  /v1/documents:
+    post:
+      summary: Publish a document through the local ingest adapter
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Document'}
+      responses:
+        '202': {description: Document accepted}
+        '400': {description: Invalid document}
+  /v1/search:
+    get:
+      summary: Hybrid keyword and semantic search
+      parameters:
+        - {name: q, in: query, required: true, schema: {type: string}}
+        - {name: deadline, in: query, schema: {type: string, example: 150ms}}
+        - {name: from, in: query, schema: {type: integer, minimum: 0}}
+        - {name: size, in: query, schema: {type: integer, minimum: 1, maximum: 100}}
+      responses:
+        '200':
+          description: Results with coverage and timings
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SearchResponse'}
+  /v1/debug/shards/{shard}:
+    post:
+      summary: Toggle a local shard failure for testing
+      parameters:
+        - {name: shard, in: path, required: true, schema: {type: integer}}
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                available: {type: boolean}
+                delay_ms: {type: integer, minimum: 0, maximum: 30000}
+      responses:
+        '200': {description: Failure mode changed}
+  /v1/admin/reindex:
+    post:
+      summary: Rebuild the search index and advance the search alias
+      responses:
+        '200': {description: Reindex completed}
+  /v1/admin/snapshot:
+    post:
+      summary: Create a verified local snapshot
+      responses:
+        '200': {description: Snapshot completed}
+  /v1/admin/restore:
+    post:
+      summary: Restore a local snapshot
+      responses:
+        '200': {description: Restore completed}
+components:
+  schemas:
+    Document:
+      type: object
+      required: [id, title, body]
+      properties:
+        id: {type: string}
+        title: {type: string}
+        body: {type: string}
+        tags: {type: array, items: {type: string}}
+    SearchResponse:
+      type: object
+      properties:
+        results: {type: array, items: {type: object}}
+        cache_hit: {type: boolean}
+        coverage:
+          type: object
+          properties:
+            shards_queried: {type: integer}
+            shards_answered: {type: integer}
+            complete: {type: boolean}
+        timings_ms: {type: object}
+        errors: {type: array, items: {type: string}}

@@ -1,0 +1,27 @@
+# Requires the OpenSearch Kubernetes Operator to be installed in the cluster.
+apiVersion: opensearch.opster.io/v1
+kind: OpenSearchCluster
+metadata:
+  name: lattice-search
+  namespace: lattice
+spec:
+  general:
+    version: 2.17.1
+    httpPort: 9200
+    vendor: opensearch
+  dashboards:
+    enable: false
+  nodePools:
+    - component: masters
+      replicas: 3
+      diskSize: 30Gi
+      roles:
+        - "master"
+        - "data"
+      resources:
+        requests:
+          memory: 2Gi
+          cpu: 500m
+        limits:
+          memory: 4Gi
+          cpu: "2"

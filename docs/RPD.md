@@ -5,6 +5,8 @@
 **Status:** Proposed
 **Date:** August 2026
 
+**Roadmap scope:** [`docs/lattice.md`](lattice.md) is the authoritative six-phase roadmap. This RPD defines the Phase 5 search product and Phase 6 operational slice, including the developer-facing Swagger UI and playground described in [`docs/walkthrough.md`](walkthrough.md).
+
 ---
 
 ## 1. Problem
@@ -72,13 +74,17 @@ Operate a hybrid search platform over 1M+ documents to a stated SLO, with capaci
 12. Cap pagination depth and require cursor-based paging past the threshold.
 13. Cache repeated queries with a bounded TTL.
 
+**Developer experience**
+14. Serve an OpenAPI specification and interactive Swagger UI for the public API.
+15. Provide a browser playground that exercises document publishing, search, coverage, timings, and safe local failure drills.
+
 **Operations**
-14. Provision cluster and node pools via Terraform.
-15. Manage index templates, ISM policies, and application config via Argo CD from git.
-16. Snapshot to S3 on a schedule; alert on snapshot age.
-17. Rehearse restore on a schedule and record the elapsed time.
-18. Expose the metrics listed in the README.
-19. Run a chaos suite in CI: node kill, network partition, merge under load.
+16. Provision cluster and node pools via Terraform.
+17. Manage index templates, ISM policies, and application config via Argo CD from git.
+18. Snapshot to S3 on a schedule; alert on snapshot age.
+19. Rehearse restore on a schedule and record the elapsed time.
+20. Expose the metrics listed in the README.
+21. Run a chaos suite in CI: node kill, network partition, merge under load.
 
 ## 7. Acceptance criteria
 
@@ -125,6 +131,11 @@ Operate a hybrid search platform over 1M+ documents to a stated SLO, with capaci
 > When queries run concurrently
 > Then p99 stays within the stated merge-window target, or the deviation is documented with the merge policy that caused it.
 
+**Developer experience**
+> Given the service is ready
+> When a developer opens Swagger UI or the playground
+> Then they can publish test documents, run hybrid searches, inspect coverage and timings, and reproduce the same requests with the documented API contract.
+
 ## 8. Non-functional requirements
 
 | Property | Target |
@@ -144,7 +155,7 @@ Operate a hybrid search platform over 1M+ documents to a stated SLO, with capaci
 - Learning-to-rank and personalised relevance
 - Query autocomplete and spell correction
 - Non-English analyzers
-- A search UI
+- A public-facing search UI; the developer Swagger UI and testing playground are in scope
 - RAG orchestration — that is [TESSERA](https://github.com/nickemma/tessera)
 
 ## 10. Success metrics
@@ -159,19 +170,19 @@ Operate a hybrid search platform over 1M+ documents to a stated SLO, with capaci
 
 | # | Increment | Requirements | Done when |
 |---|---|---|---|
-| 1 | Terraform cluster + OpenSearch operator | 14 | Cluster green, reachable, rebuildable from scratch |
-| 2 | Index template + mapping in git, Argo-reconciled | 15 | Changing a mapping is a pull request |
+| 1 | Terraform cluster + OpenSearch operator | 16 | Cluster green, reachable, rebuildable from scratch |
+| 2 | Index template + mapping in git, Argo-reconciled | 17 | Changing a mapping is a pull request |
 | 3 | Direct bulk indexing, 10k docs, no pipeline | 3 | Docs queryable via OpenSearch directly |
 | 4 | **Baseline benchmark** | — | BM25 p99 at 10k docs recorded — the number everything is compared against |
 | 5 | Kafka + indexer with offsets and backpressure | 1, 4, 5 | Kill the indexer mid-batch; resume, no loss, no duplicates |
 | 6 | Embeddings + kNN field | 2 | Vector search returns sensible neighbours |
 | 7 | Query service: hybrid fusion, deadlines, coverage | 7–11 | `complete: false` observed under a killed shard |
 | 8 | Scale corpus to 1M, retune shards | — | Shard sizing decision documented with the measurement behind it |
-| 9 | ISM lifecycle + snapshots + **restore drill** | 16, 17 | Restore completed and timed |
+| 9 | ISM lifecycle + snapshots + **restore drill** | 18, 19 | Restore completed and timed |
 | 10 | Zero-downtime reindex + alias swap | 6 | Mapping changed under live query load, zero errors |
 | 11 | Result cache + pagination guards | 12, 13 | Deep-pagination query rejected; cache hit rate measured |
-| 12 | Full observability + dashboards | 18 | Every README metric live in Grafana |
-| 13 | Chaos suite in CI | 19 | Node kill and partition run automatically, assertions hold |
+| 12 | Full observability + dashboards | 20 | Every README metric live in Grafana |
+| 13 | Chaos suite in CI | 21 | Node kill and partition run automatically, assertions hold |
 | 14 | Capacity + cost report | — | `docs/benchmarks.md` complete, no estimated cells |
 
 Row 4 exists for the same reason it does in TESSERA: without a pre-platform baseline you cannot attribute later latency to anything. Row 9 is the row most projects skip and the one that most distinguishes an operator from a tutorial-follower.

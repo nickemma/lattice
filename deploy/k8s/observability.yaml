@@ -1,0 +1,105 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: lattice-query
+  namespace: lattice
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: lattice-query
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: lattice-indexer
+  namespace: lattice
+spec:
+  maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: lattice-indexer
+---
+# Requires the Prometheus Operator. The application endpoint remains usable
+# without it, which keeps the manifests renderable on a plain Kubernetes cluster.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: lattice-query
+  namespace: lattice
+  labels:
+    app: lattice-query
+spec:
+  selector:
+    matchLabels:
+      app: lattice-query
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: lattice-indexer
+  namespace: lattice
+  labels:
+    app: lattice-indexer
+spec:
+  selector:
+    matchLabels:
+      app: lattice-indexer
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+---
+# Requires the Prometheus Operator. Thresholds are intentionally conservative
+# starter alerts; tune them after the declared production workload is measured.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: lattice-slo
+  namespace: lattice
+  labels:
+    app: lattice-query
+spec:
+  groups:
+    - name: lattice.slo
+      rules:
+        - alert: LatticeIncompleteSearchRateHigh
+          expr: rate(lattice_query_incomplete_total[10m]) / clamp_min(rate(lattice_query_requests_total[10m]), 1) > 0.01
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: LATTICE is returning too many incomplete searches
+            description: More than one percent of searches have incomplete shard coverage.
+        - alert: LatticeQueryErrorBudgetBurn
+          expr: histogram_quantile(0.99, sum(rate(lattice_query_duration_seconds_bucket[10m])) by (le)) > 0.2
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: LATTICE query p99 is above the 200ms target
+            description: Investigate shard latency, OpenSearch merges, and JVM pressure.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lattice-grafana-dashboard
+  namespace: lattice
+  labels:
+    grafana_dashboard: "1"
+data:
+  lattice.json: |
+    {
+      "title": "LATTICE overview",
+      "schemaVersion": 39,
+      "panels": [
+        {"type":"timeseries","title":"Query rate","targets":[{"expr":"rate(lattice_query_requests_total[5m])"}]},
+        {"type":"timeseries","title":"Incomplete coverage rate","targets":[{"expr":"rate(lattice_query_incomplete_total[5m]) / clamp_min(rate(lattice_query_requests_total[5m]), 1)"}]},
+        {"type":"timeseries","title":"Query p99","targets":[{"expr":"histogram_quantile(0.99, sum(rate(lattice_query_duration_seconds_bucket[5m])) by (le))"}]},
+        {"type":"stat","title":"Indexed documents","targets":[{"expr":"lattice_index_documents"}]}
+      ]
+    }

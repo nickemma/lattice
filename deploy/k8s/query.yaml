@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lattice-query
+  namespace: lattice
+  labels:
+    app: lattice-query
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: lattice-query
+  template:
+    metadata:
+      labels:
+        app: lattice-query
+    spec:
+      serviceAccountName: lattice-query
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: query
+          image: lattice:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: LATTICE_ADDR
+              value: ":8080"
+            - name: LATTICE_DATA_DIR
+              value: /var/lib/lattice
+            - name: OPENSEARCH_URL
+              value: http://lattice-search-cluster-master:9200
+            - name: KAFKA_BROKERS
+              value: lattice-kafka:9092
+            - name: REDIS_URL
+              value: redis://lattice-redis:6379/0
+            - name: EMBEDDING_URL
+              value: ""
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: 1, memory: 512Mi}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/lattice
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: lattice-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: lattice-data
+  namespace: lattice
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lattice-query
+  namespace: lattice
+spec:
+  selector:
+    app: lattice-query
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
