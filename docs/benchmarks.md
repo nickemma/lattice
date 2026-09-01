@@ -20,12 +20,13 @@ This report is intentionally a measurement log. Empty cells are not estimates.
 | Raft repeated test suite | 100 runs | 100/100 passed | Go logical cluster, local test runner | 2026-08-31 |
 | Local hybrid search benchmark, 10k docs | — | 89.96ms/op | AMD Ryzen 7 PRO 5850U, Go benchmark, 16 workers | 2026-08-30 |
 | Local hybrid search benchmark, 1M docs | — | 1.485s/op (one sample) | AMD Ryzen 7 PRO 5850U, deterministic in-process backend, Go benchmark | 2026-08-31 |
-| Compose acceptance flow | — | Passed | Redpanda v24.3.8, OpenSearch 2.17.1, Redis 7.4; publish/search, indexer restart replay, alias reindex | 2026-08-31 |
+| Compose acceptance flow | — | Passed | Redpanda v24.3.8, OpenSearch 2.17.1, Redis 7.4; unique publish/search, indexer restart replay, alias reindex, native snapshot/restore, metrics | 2026-09-01 |
 | Compose native snapshot/restore | — | 712ms | OpenSearch filesystem repository, 8-document test corpus, API restore into a fresh target; one acceptance run | 2026-08-31 |
 | Compose full-corpus remote benchmark | < 200ms p99 target | 16.66ms p50, 191.85ms p99, 1,514 QPS, 0 HTTP failures, 93 incomplete responses | OpenSearch 2.17.1, Redpanda v24.3.8, Redis 7.4; 1,000,008 docs; concurrency 32 | 2026-08-31 |
 | Compose merge-window remote benchmark | < 400ms p99 target | 24.69ms p50, 95.55ms p99, 939 QPS, 0 HTTP failures, 64 incomplete responses | Same stack; 100,000 concurrent API publishes during 10,000 queries | 2026-08-31 |
 | Compose explicit force-merge benchmark | < 400ms p99 target | 18.00ms p50, 49.06ms p99, 1,547 QPS, 0 HTTP failures, 24 incomplete responses; merge completed in 360.390s | Same stack; asynchronous OpenSearch `_forcemerge(max_num_segments=1)`; 59 → 3 primary segments; document count unchanged | 2026-08-31 |
 | Kubernetes operator/application smoke | — | Passed: fresh operator OpenSearch `1/1`, Redpanda, Redis, indexer, and query all `1/1`; API publish → Kafka/indexer → hybrid search returned `coverage.complete:true` | Fresh kind cluster; Terraform; cert-manager 1.16.3; OpenSearch Operator 2.8.4 / `opensearch.org/v1`; OpenSearch 2.17.1; Redpanda v24.3.8 | 2026-08-31 |
+| Latest Compose restore assertion | — | Passed: 18.342s restore operation; replay document remained searchable with `coverage.complete:true` after restore | Existing Compose corpus; OpenSearch filesystem repository; fresh restore target; corrected `make smoke-compose` | 2026-09-01 |
 
 ## Election distribution
 

@@ -311,6 +311,11 @@ Publishing is asynchronous in Compose. After the CLI exits, wait for
 the normal range. The measured million-document run took 450.53s to publish
 and then drained to 1,000,008 searchable documents before benchmarking.
 
+The latest corrected `make smoke-compose` acceptance run also passed unique
+publish/search, indexer-stop replay, alias reindex, native snapshot, and fresh
+target restore. Its restore operation took 18.342s and the replay document was
+still searchable with `coverage.complete:true` afterward.
+
 ## 9. Kubernetes path
 
 Render the manifests before applying them:
