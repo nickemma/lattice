@@ -88,8 +88,29 @@ git -C "$snapshot_dir" add -A
 git -C "$snapshot_dir" -c user.name=LATTICE -c user.email=lattice@example.invalid commit -m snapshot >/dev/null
 git clone --bare "$snapshot_dir" "$bare_repo" >/dev/null
 git -C "$bare_repo" config daemon.export ok
+if [[ -z "${LATTICE_ARGOCD_GIT_PORT:-}" ]]; then
+  for candidate_port in $(seq 19418 19448); do
+    if command -v ss >/dev/null 2>&1; then
+      if ! ss -ltnH | awk -v port=":$candidate_port" '$4 ~ port"$" { found=1 } END { exit found }'; then
+        ARGOCD_GIT_PORT="$candidate_port"
+        break
+      fi
+    elif ! (exec 3<>"/dev/tcp/127.0.0.1/$candidate_port") 2>/dev/null; then
+      ARGOCD_GIT_PORT="$candidate_port"
+      break
+    fi
+  done
+fi
+
+echo "starting temporary Git daemon on port $ARGOCD_GIT_PORT"
 git daemon --reuseaddr --base-path="$TMP_DIR" --export-all --port="$ARGOCD_GIT_PORT" "$TMP_DIR" >"$TMP_DIR/git-daemon.log" 2>&1 &
 GIT_PID=$!
+sleep 1
+if ! kill -0 "$GIT_PID" >/dev/null 2>&1 || ! git ls-remote "git://127.0.0.1:$ARGOCD_GIT_PORT/lattice.git" >/dev/null 2>&1; then
+  echo "temporary Git daemon failed to serve the snapshot" >&2
+  cat "$TMP_DIR/git-daemon.log" >&2 || true
+  exit 1
+fi
 
 git_gateway=""
 for candidate in $(docker network inspect kind -f '{{range .IPAM.Config}}{{.Gateway}} {{end}}'); do
