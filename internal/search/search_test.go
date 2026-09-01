@@ -35,3 +35,50 @@ func TestDeadlineReturnsPartialResults(t *testing.T) {
 		t.Fatalf("expected partial results: %+v", result)
 	}
 }
+
+func TestSearchFiltersRequireAllTags(t *testing.T) {
+	i := NewIndex(2)
+	i.Upsert(Document{ID: "one", Title: "Raft", Body: "consensus", Tags: []string{"distributed", "consensus"}})
+	i.Upsert(Document{ID: "two", Title: "Raft", Body: "consensus", Tags: []string{"distributed"}})
+	result := i.SearchWithFilters(context.Background(), "consensus", []string{"distributed", "consensus"}, 0, 10)
+	if len(result.Results) != 1 || result.Results[0].Document.ID != "one" {
+		t.Fatalf("filtered result = %+v", result.Results)
+	}
+}
+
+func TestSearchCursorContinuesStablePage(t *testing.T) {
+	i := NewIndex(1)
+	for _, id := range []string{"one", "two", "three"} {
+		if err := i.Upsert(Document{ID: id, Title: "consensus", Body: "consensus"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first := i.SearchWithFilters(context.Background(), "consensus", nil, 0, 1)
+	if len(first.Results) != 1 || first.NextCursor == "" {
+		t.Fatalf("first page = %+v", first)
+	}
+	second := i.SearchWithFiltersCursor(context.Background(), "consensus", nil, first.NextCursor, 1)
+	if len(second.Results) != 1 || second.Results[0].Document.ID == first.Results[0].Document.ID {
+		t.Fatalf("second page = %+v", second)
+	}
+	if _, err := DecodeCursor("not-a-cursor"); err == nil {
+		t.Fatal("expected malformed cursor error")
+	}
+}
+
+func TestIncompleteSearchDoesNotAdvertiseCursor(t *testing.T) {
+	i := NewIndex(2)
+	if err := i.Upsert(Document{ID: "one", Title: "consensus", Body: "consensus"}); err != nil {
+		t.Fatal(err)
+	}
+	i.SetShardDelay(1, time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	response := i.SearchWithFilters(ctx, "consensus", nil, 0, 1)
+	if response.Coverage.Complete {
+		t.Fatalf("expected incomplete response: %+v", response.Coverage)
+	}
+	if response.NextCursor != "" {
+		t.Fatalf("incomplete response advertised cursor: %q", response.NextCursor)
+	}
+}

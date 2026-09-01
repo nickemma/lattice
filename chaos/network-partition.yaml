@@ -1,0 +1,25 @@
+# Optional Chaos Mesh experiment. Install Chaos Mesh first, review the
+# selectors, and apply only during an approved test window.
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: lattice-query-opensearch-partition
+  namespace: lattice
+spec:
+  action: partition
+  mode: all
+  direction: to
+  selector:
+    namespaces:
+      - lattice
+    labelSelectors:
+      app: lattice-query
+  target:
+    mode: all
+    selector:
+      namespaces:
+        - lattice
+      labelSelectors:
+        # Current Operator API applies this label to cluster node pods.
+        opensearch.org/opensearch-cluster: lattice-search
+  duration: "2m"

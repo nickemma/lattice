@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -15,10 +16,14 @@ import (
 )
 
 type Backend struct {
-	Client   *Client
-	Index    string
-	Embedder embedding.Embedder
-	count    atomic.Int64
+	Client    *Client
+	Index     string
+	Alias     string
+	Embedder  embedding.Embedder
+	count     atomic.Int64
+	indexMu   sync.RWMutex
+	writeMu   sync.RWMutex
+	dualWrite string
 }
 
 type branchResult struct {
@@ -37,6 +42,25 @@ func NewBackendWithEmbedder(client *Client, index string, embedder embedding.Emb
 	backend := NewBackend(client, index)
 	backend.Embedder = embedder
 	return backend
+}
+
+func NewBackendWithAlias(client *Client, index, alias string) *Backend {
+	return &Backend{Client: client, Index: index, Alias: alias}
+}
+
+func NewBackendWithAliasAndEmbedder(client *Client, index, alias string, embedder embedding.Embedder) *Backend {
+	backend := NewBackendWithAlias(client, index, alias)
+	backend.Embedder = embedder
+	return backend
+}
+
+func (b *Backend) searchIndex() string {
+	b.indexMu.RLock()
+	defer b.indexMu.RUnlock()
+	if b.Alias != "" {
+		return b.Alias
+	}
+	return b.Index
 }
 
 func (b *Backend) Upsert(doc search.Document) error {
@@ -76,23 +100,51 @@ func (b *Backend) BulkUpsert(ctx context.Context, documents []search.Document) (
 	if err != nil {
 		return nil, err
 	}
-	var payload []byte
-	for n, doc := range documents {
-		meta, err := json.Marshal(map[string]any{"index": map[string]string{"_index": b.Index, "_id": doc.ID}})
+	b.writeMu.RLock()
+	defer b.writeMu.RUnlock()
+	dualWrite := b.dualWrite
+	primary, err := b.bulkInto(ctx, b.searchIndex(), documents, vectors)
+	if err != nil {
+		return nil, err
+	}
+	if dualWrite != "" {
+		secondary, err := b.bulkInto(ctx, dualWrite, documents, vectors)
 		if err != nil {
 			return nil, err
 		}
-		document := map[string]any{
+		for n := range primary {
+			if primary[n].Status >= 200 && primary[n].Status < 300 && secondary[n].Status >= 400 {
+				primary[n] = secondary[n]
+			}
+		}
+	}
+	indexed := int64(0)
+	for _, outcome := range primary {
+		if outcome.Status >= 200 && outcome.Status < 300 {
+			indexed++
+		}
+	}
+	b.count.Add(indexed)
+	return primary, nil
+}
+
+func (b *Backend) bulkInto(ctx context.Context, index string, documents []search.Document, vectors [][]float64) ([]BulkOutcome, error) {
+	var payload []byte
+	for n, doc := range documents {
+		meta, err := json.Marshal(map[string]any{"index": map[string]string{"_index": index, "_id": doc.ID}})
+		if err != nil {
+			return nil, err
+		}
+		document, err := json.Marshal(map[string]any{
 			"id": doc.ID, "title": doc.Title, "body": doc.Body,
 			"tags": doc.Tags, "embedding": vectors[n],
-		}
-		body, err := json.Marshal(document)
+		})
 		if err != nil {
 			return nil, err
 		}
 		payload = append(payload, meta...)
 		payload = append(payload, '\n')
-		payload = append(payload, body...)
+		payload = append(payload, document...)
 		payload = append(payload, '\n')
 	}
 	response, err := b.Client.Bulk(ctx, payload)
@@ -103,14 +155,9 @@ func (b *Backend) BulkUpsert(ctx context.Context, documents []search.Document) (
 		return nil, fmt.Errorf("opensearch: bulk returned %d items for %d documents", len(response.Items), len(documents))
 	}
 	outcomes := make([]BulkOutcome, len(documents))
-	indexed := int64(0)
 	for n, item := range response.Items {
 		outcomes[n] = BulkOutcome{ID: documents[n].ID, Status: item.Index.Status, Error: strings.TrimSpace(string(item.Index.Error))}
-		if item.Index.Status >= 200 && item.Index.Status < 300 {
-			indexed++
-		}
 	}
-	b.count.Add(indexed)
 	return outcomes, nil
 }
 
@@ -138,10 +185,105 @@ func (b *Backend) embed(ctx context.Context, texts []string) ([][]float64, error
 }
 
 func (b *Backend) EnsureIndex(ctx context.Context) error {
+	if b.Alias != "" {
+		targets, err := b.Client.AliasTargets(ctx, b.Alias)
+		if err == nil && len(targets) > 0 {
+			return nil
+		}
+		if err != nil && !strings.Contains(err.Error(), "404 Not Found") {
+			return err
+		}
+	}
+	if err := b.ensureIndex(ctx, b.Index); err != nil {
+		return err
+	}
+	if b.Alias != "" {
+		return b.Client.AddAlias(ctx, b.Index, b.Alias)
+	}
+	return nil
+}
+
+func (b *Backend) ensureIndex(ctx context.Context, index string) error {
 	body := []byte(`{"settings":{"index":{"knn":true,"number_of_shards":3,"number_of_replicas":1}},"mappings":{"properties":{"id":{"type":"keyword"},"title":{"type":"text"},"body":{"type":"text"},"tags":{"type":"keyword"},"embedding":{"type":"knn_vector","dimension":64}}}}`)
-	_, err := b.Client.do(ctx, "PUT", "/"+b.Index, body)
+	_, err := b.Client.do(ctx, "PUT", "/"+index, body)
 	if err != nil && !strings.Contains(err.Error(), "resource_already_exists_exception") {
 		return err
+	}
+	return nil
+}
+
+type ReindexReport struct {
+	Source      string `json:"source"`
+	Destination string `json:"destination"`
+	Alias       string `json:"alias"`
+}
+
+func (b *Backend) Reindex(ctx context.Context) (ReindexReport, error) {
+	if b.Alias == "" {
+		return ReindexReport{}, errors.New("opensearch: reindex requires a configured alias")
+	}
+	oldIndexes, err := b.Client.AliasTargets(ctx, b.Alias)
+	if err != nil || len(oldIndexes) == 0 {
+		return ReindexReport{}, fmt.Errorf("opensearch: resolve alias %q: %w", b.Alias, err)
+	}
+	destination := fmt.Sprintf("%s-%d", b.Index, time.Now().UTC().UnixNano())
+	if err := b.ensureIndex(ctx, destination); err != nil {
+		return ReindexReport{}, fmt.Errorf("opensearch: create reindex target: %w", err)
+	}
+	b.writeMu.Lock()
+	b.dualWrite = destination
+	b.writeMu.Unlock()
+	clearDualWrite := func() {
+		b.writeMu.Lock()
+		b.dualWrite = ""
+		b.writeMu.Unlock()
+	}
+	if err := b.Client.Reindex(ctx, oldIndexes[0], destination); err != nil {
+		clearDualWrite()
+		return ReindexReport{}, fmt.Errorf("opensearch: reindex: %w", err)
+	}
+	b.writeMu.Lock()
+	err = b.Client.SwapAlias(ctx, b.Alias, destination, oldIndexes)
+	b.dualWrite = ""
+	b.writeMu.Unlock()
+	if err != nil {
+		return ReindexReport{}, fmt.Errorf("opensearch: swap alias: %w", err)
+	}
+	return ReindexReport{Source: oldIndexes[0], Destination: destination, Alias: b.Alias}, nil
+}
+
+func (b *Backend) Snapshot(ctx context.Context, repository, snapshot string) error {
+	if strings.TrimSpace(repository) == "" || strings.TrimSpace(snapshot) == "" {
+		return errors.New("opensearch: repository and snapshot are required")
+	}
+	return b.Client.Snapshot(ctx, repository, snapshot, b.searchIndex())
+}
+
+func (b *Backend) Restore(ctx context.Context, repository, snapshot, sourceIndex, targetIndex string) error {
+	if strings.TrimSpace(repository) == "" || strings.TrimSpace(snapshot) == "" {
+		return errors.New("opensearch: repository and snapshot are required")
+	}
+	if b.Alias != "" && targetIndex == "" {
+		return errors.New("opensearch: target index is required when restoring behind an alias")
+	}
+	if sourceIndex == "" && targetIndex == "" {
+		sourceIndex = b.Index
+	}
+	if err := b.Client.Restore(ctx, repository, snapshot, sourceIndex, targetIndex); err != nil {
+		return err
+	}
+	if b.Alias != "" {
+		// A snapshot may carry alias metadata even with global state excluded.
+		// Resolve the alias after restore so the swap removes both the previous
+		// generation and any alias that OpenSearch restored on the target.
+		currentIndexes, err := b.Client.AliasTargets(ctx, b.Alias)
+		if err == nil && len(currentIndexes) > 0 {
+			return b.Client.SwapAlias(ctx, b.Alias, targetIndex, currentIndexes)
+		}
+		if err != nil && !strings.Contains(err.Error(), "404 Not Found") {
+			return err
+		}
+		return b.Client.AddAlias(ctx, targetIndex, b.Alias)
 	}
 	return nil
 }
@@ -173,6 +315,15 @@ func (b *Backend) Ready(ctx context.Context) error {
 	if err := b.Client.Ready(ctx); err != nil {
 		return err
 	}
+	if b.Alias != "" {
+		targets, err := b.Client.AliasTargets(ctx, b.Alias)
+		if err != nil {
+			return fmt.Errorf("opensearch alias %q: %w", b.Alias, err)
+		}
+		if len(targets) == 0 {
+			return fmt.Errorf("opensearch alias %q has no target", b.Alias)
+		}
+	}
 	if checker, ok := b.Embedder.(interface{ Ready(context.Context) error }); ok {
 		return checker.Ready(ctx)
 	}
@@ -182,7 +333,7 @@ func (b *Backend) Ready(ctx context.Context) error {
 func (b *Backend) Count() int {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	count, err := b.Client.Count(ctx, b.Index)
+	count, err := b.Client.Count(ctx, b.searchIndex())
 	if err == nil && count >= 0 {
 		b.count.Store(count)
 	}
@@ -190,6 +341,25 @@ func (b *Backend) Count() int {
 }
 
 func (b *Backend) Search(ctx context.Context, query string, from, size int) search.Response {
+	return b.SearchWithFilters(ctx, query, nil, from, size)
+}
+
+func (b *Backend) SearchWithFilters(ctx context.Context, query string, tags []string, from, size int) search.Response {
+	return b.searchWithFilters(ctx, query, tags, from, size, true)
+}
+
+func (b *Backend) SearchWithFiltersCursor(ctx context.Context, query string, tags []string, token string, size int) search.Response {
+	cursor, err := search.DecodeCursor(token)
+	if err != nil {
+		return search.Response{Errors: []string{err.Error()}}
+	}
+	if cursor.Query != query || cursor.Size != size || !sameTags(cursor.Tags, tags) {
+		return search.Response{Errors: []string{"cursor does not match query, filters, or page size"}}
+	}
+	return b.searchWithFilters(ctx, query, tags, cursor.Offset, size, true)
+}
+
+func (b *Backend) searchWithFilters(ctx context.Context, query string, tags []string, from, size int, cursorEnabled bool) search.Response {
 	started := time.Now()
 	if size <= 0 {
 		size = 10
@@ -198,10 +368,18 @@ func (b *Backend) Search(ctx context.Context, query string, from, size int) sear
 	if limit < 10 {
 		limit = 10
 	}
-	keywordBody, _ := json.Marshal(map[string]any{
-		"from": 0, "size": limit,
-		"query": map[string]any{"multi_match": map[string]any{"query": query, "fields": []string{"title^2", "body", "tags"}}},
-	})
+	keywordQuery := map[string]any{"multi_match": map[string]any{"query": query, "fields": []string{"title^2", "body", "tags"}}}
+	if len(tags) > 0 {
+		filters := make([]any, 0, len(tags))
+		for _, tag := range tags {
+			filters = append(filters, map[string]any{"term": map[string]any{"tags": tag}})
+		}
+		keywordQuery = map[string]any{"bool": map[string]any{
+			"must":   []any{keywordQuery},
+			"filter": filters,
+		}}
+	}
+	keywordBody, _ := json.Marshal(map[string]any{"from": 0, "size": limit, "query": keywordQuery})
 	response := search.Response{}
 	branchCount := 1
 	channels := make(chan branchResult, 2)
@@ -211,9 +389,17 @@ func (b *Backend) Search(ctx context.Context, query string, from, size int) sear
 		response.Errors = append(response.Errors, "embedding: "+embedErr.Error())
 	}
 	if embedErr == nil {
+		knn := map[string]any{"vector": queryVectors[0], "k": limit}
+		if len(tags) > 0 {
+			filters := make([]any, 0, len(tags))
+			for _, tag := range tags {
+				filters = append(filters, map[string]any{"term": map[string]any{"tags": tag}})
+			}
+			knn["filter"] = map[string]any{"bool": map[string]any{"filter": filters}}
+		}
 		vectorBody, _ := json.Marshal(map[string]any{
 			"size":  limit,
-			"query": map[string]any{"knn": map[string]any{"embedding": map[string]any{"vector": queryVectors[0], "k": limit}}},
+			"query": map[string]any{"knn": map[string]any{"embedding": knn}},
 		})
 		branchCount = 2
 		go func() { channels <- b.searchBranch(ctx, "vector", vectorBody) }()
@@ -252,17 +438,33 @@ func (b *Backend) Search(ctx context.Context, query string, from, size int) sear
 	response.Coverage = coverage
 	response.Timings.Parse = float64(time.Since(started).Microseconds()) / 1000
 	response.Results = search.FuseResults(bm25, vector)
-	if from >= len(response.Results) {
+	totalResults := len(response.Results)
+	if from >= totalResults {
 		response.Results = nil
 	} else {
 		end := from + size
-		if end > len(response.Results) {
-			end = len(response.Results)
+		if end > totalResults {
+			end = totalResults
 		}
 		response.Results = response.Results[from:end]
+		if cursorEnabled && end < totalResults && response.Coverage.Complete && len(response.Errors) == 0 {
+			response.NextCursor = search.EncodeCursor(search.Cursor{Query: query, Tags: append([]string(nil), tags...), Size: size, Offset: end})
+		}
 	}
 	response.Timings.Fuse = float64(time.Since(started).Microseconds()) / 1000
 	return response
+}
+
+func sameTags(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for n := range left {
+		if left[n] != right[n] {
+			return false
+		}
+	}
+	return true
 }
 
 type shardsInfo struct {
@@ -272,7 +474,7 @@ type shardsInfo struct {
 
 func (b *Backend) searchBranch(ctx context.Context, name string, body []byte) branchResult {
 	started := time.Now()
-	data, err := b.Client.Search(ctx, b.Index, body)
+	data, err := b.Client.Search(ctx, b.searchIndex(), body)
 	result := branchResult{name: name, err: err}
 	if err != nil {
 		result.elapsed = time.Since(started)

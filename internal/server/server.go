@@ -2,15 +2,20 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/nickemma/lattice/internal/ingest"
+	"github.com/nickemma/lattice/internal/providers/opensearch"
 	"github.com/nickemma/lattice/internal/search"
 )
 
@@ -21,6 +26,8 @@ type Server struct {
 	Broker       *ingest.Broker
 	Indexer      *ingest.Indexer
 	Cache        Cache
+	apiKey       string
+	querySlots   chan struct{}
 	mode         string
 	queries      atomic.Uint64
 	docs         atomic.Uint64
@@ -32,6 +39,8 @@ type Server struct {
 	queryBuckets [6]atomic.Uint64
 }
 
+var requestSequence atomic.Uint64
+
 type Publisher interface {
 	Publish(context.Context, []byte, []byte) error
 }
@@ -41,14 +50,39 @@ type Cache interface {
 	Set(context.Context, string, []byte) error
 }
 
+type cacheInvalidator interface {
+	Clear(context.Context) error
+}
+
 func New(index *search.Index) *Server {
 	broker := ingest.NewBroker()
-	return &Server{Index: index, Backend: index, Broker: broker, Indexer: ingest.NewIndexer(broker, index), mode: "local-index"}
+	return newServer(index, broker, "local-index")
 }
 
 func NewWithBackend(backend search.Backend) *Server {
 	broker := ingest.NewBroker()
-	return &Server{Backend: backend, Broker: broker, Indexer: ingest.NewIndexer(broker, backend), mode: "configured-backend"}
+	return newServer(backend, broker, "configured-backend")
+}
+
+func newServer(backend search.Backend, broker *ingest.Broker, mode string) *Server {
+	server := &Server{Backend: backend, Broker: broker, Indexer: ingest.NewIndexer(broker, backend), mode: mode, apiKey: os.Getenv("LATTICE_API_KEY")}
+	if value := os.Getenv("LATTICE_MAX_INFLIGHT_QUERIES"); value != "" {
+		if limit, err := strconv.Atoi(value); err == nil && limit > 0 {
+			server.querySlots = make(chan struct{}, limit)
+		}
+	}
+	if index, ok := backend.(*search.Index); ok {
+		server.Index = index
+	}
+	return server
+}
+
+// NewWithAPIKey is useful for embedding the service and for tests. The
+// executable normally obtains the key from LATTICE_API_KEY.
+func NewWithAPIKey(index *search.Index, apiKey string) *Server {
+	server := New(index)
+	server.apiKey = apiKey
+	return server
 }
 
 func NewWithBackendAndPublisher(backend search.Backend, publisher Publisher) *Server {
@@ -76,7 +110,23 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/admin/reindex", s.reindex)
 	mux.HandleFunc("/v1/admin/snapshot", s.snapshot)
 	mux.HandleFunc("/v1/admin/restore", s.restore)
-	return requestLog(mux)
+	return requestLog(s.authenticate(mux))
+}
+
+func (s *Server) authenticate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.apiKey == "" || !strings.HasPrefix(r.URL.Path, "/v1/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		provided := r.Header.Get("X-API-Key")
+		if len(provided) != len(s.apiKey) || subtle.ConstantTimeCompare([]byte(provided), []byte(s.apiKey)) != 1 {
+			w.Header().Set("WWW-Authenticate", `ApiKey realm="lattice"`)
+			writeError(w, http.StatusUnauthorized, "valid X-API-Key is required")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
@@ -150,6 +200,7 @@ func (s *Server) documents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method must be POST")
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var doc search.Document
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
@@ -196,6 +247,23 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	searchAfter := strings.TrimSpace(r.URL.Query().Get("search_after"))
+	if searchAfter != "" {
+		cursor, cursorErr := search.DecodeCursor(searchAfter)
+		if cursorErr != nil {
+			writeError(w, http.StatusBadRequest, cursorErr.Error())
+			return
+		}
+		if r.URL.Query().Get("from") != "" && from != 0 {
+			writeError(w, http.StatusBadRequest, "from cannot be combined with search_after")
+			return
+		}
+		if cursor.Query != query || cursor.Size != size || !sameSearchTags(cursor.Tags, normalizedTags(r.URL.Query()["tag"])) {
+			writeError(w, http.StatusBadRequest, "search_after does not match query, filters, or page size")
+			return
+		}
+		from = cursor.Offset
+	}
 	deadline := 200 * time.Millisecond
 	if value := r.URL.Query().Get("deadline"); value != "" {
 		deadline, err = time.ParseDuration(value)
@@ -206,9 +274,22 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), deadline)
 	defer cancel()
+	if s.querySlots != nil {
+		select {
+		case s.querySlots <- struct{}{}:
+			defer func() { <-s.querySlots }()
+		default:
+			writeError(w, http.StatusTooManyRequests, "query concurrency limit reached")
+			return
+		}
+	}
+	tags := normalizedTags(r.URL.Query()["tag"])
 	s.queries.Add(1)
 	started := time.Now()
-	cacheKey := fmt.Sprintf("lattice:query:%d:%d:%s", from, size, query)
+	// The remote index is updated asynchronously by the Kafka consumer. Include
+	// the current document count so a response cached before an ingest cannot
+	// remain authoritative after the index changes.
+	cacheKey := fmt.Sprintf("lattice:query:%d:%d:%d:%s:%s", s.Backend.Count(), from, size, query, strings.Join(tags, ","))
 	if s.Cache != nil {
 		if payload, ok, cacheErr := s.Cache.Get(ctx, cacheKey); cacheErr == nil && ok {
 			var cached search.Response
@@ -221,7 +302,20 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	response := s.Backend.Search(ctx, query, from, size)
+	var response search.Response
+	if searchAfter != "" {
+		if cursorBackend, ok := s.Backend.(search.CursorBackend); ok {
+			response = cursorBackend.SearchWithFiltersCursor(ctx, query, tags, searchAfter, size)
+		} else if filtered, ok := s.Backend.(search.FilteredBackend); ok {
+			response = filtered.SearchWithFilters(ctx, query, tags, from, size)
+		} else {
+			response = s.Backend.Search(ctx, query, from, size)
+		}
+	} else if filtered, ok := s.Backend.(search.FilteredBackend); ok {
+		response = filtered.SearchWithFilters(ctx, query, tags, from, size)
+	} else {
+		response = s.Backend.Search(ctx, query, from, size)
+	}
 	s.observeQuery(time.Since(started))
 	if response.CacheHit {
 		s.cacheHits.Add(1)
@@ -239,6 +333,37 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response)
 }
 
+func normalizedTags(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		for _, tag := range strings.Split(value, ",") {
+			tag = strings.ToLower(strings.TrimSpace(tag))
+			if tag == "" {
+				continue
+			}
+			if _, ok := seen[tag]; ok {
+				continue
+			}
+			seen[tag] = struct{}{}
+			result = append(result, tag)
+		}
+	}
+	return result
+}
+
+func sameSearchTags(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for n := range left {
+		if left[n] != right[n] {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Server) observeQuery(elapsed time.Duration) {
 	s.queryNanos.Add(uint64(elapsed))
 	seconds := elapsed.Seconds()
@@ -246,6 +371,14 @@ func (s *Server) observeQuery(elapsed time.Duration) {
 	for n, limit := range limits {
 		if seconds <= limit {
 			s.queryBuckets[n].Add(1)
+		}
+	}
+}
+
+func (s *Server) invalidateCache() {
+	if invalidator, ok := s.Cache.(cacheInvalidator); ok {
+		if err := invalidator.Clear(context.Background()); err != nil {
+			log.Printf("lattice cache invalidation: %v", err)
 		}
 	}
 }
@@ -282,6 +415,7 @@ func (s *Server) debugShard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.Index.SetShardDelay(shard, time.Duration(request.DelayMS)*time.Millisecond)
+	s.invalidateCache()
 	writeJSON(w, http.StatusOK, map[string]any{"shard": shard, "available": request.Available, "delay_ms": request.DelayMS})
 }
 
@@ -290,14 +424,29 @@ func (s *Server) reindex(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method must be POST")
 		return
 	}
+	if remote, ok := s.Backend.(interface {
+		Reindex(context.Context) (opensearch.ReindexReport, error)
+	}); ok {
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+		defer cancel()
+		report, err := remote.Reindex(ctx)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "reindex: "+err.Error())
+			return
+		}
+		s.invalidateCache()
+		writeJSON(w, http.StatusOK, report)
+		return
+	}
 	if s.Index == nil {
-		writeError(w, http.StatusNotImplemented, "reindex requires the local backend")
+		writeError(w, http.StatusNotImplemented, "reindex requires a local backend or configured OpenSearch alias")
 		return
 	}
 	if err := s.Index.Reindex(); err != nil {
 		writeError(w, http.StatusInternalServerError, "reindex: "+err.Error())
 		return
 	}
+	s.invalidateCache()
 	version := s.alias.Add(1)
 	writeJSON(w, http.StatusOK, map[string]any{"alias": "search", "version": version, "documents": s.Backend.Count()})
 }
@@ -307,17 +456,35 @@ func (s *Server) snapshot(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method must be POST")
 		return
 	}
-	if s.Index == nil {
-		writeError(w, http.StatusNotImplemented, "snapshot requires the local backend")
-		return
-	}
-	path := s.Index.SnapshotPath()
 	var request struct {
-		Path string `json:"path"`
+		Path       string `json:"path"`
+		Repository string `json:"repository"`
+		Snapshot   string `json:"snapshot"`
 	}
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&request)
 	}
+	if remote, ok := s.Backend.(interface {
+		Snapshot(context.Context, string, string) error
+	}); ok {
+		if request.Repository == "" || request.Snapshot == "" {
+			writeError(w, http.StatusBadRequest, "repository and snapshot are required for a remote snapshot")
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+		defer cancel()
+		if err := remote.Snapshot(ctx, request.Repository, request.Snapshot); err != nil {
+			writeError(w, http.StatusBadGateway, "snapshot: "+err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"repository": request.Repository, "snapshot": request.Snapshot})
+		return
+	}
+	if s.Index == nil {
+		writeError(w, http.StatusNotImplemented, "snapshot requires a local backend or configured OpenSearch repository")
+		return
+	}
+	path := s.Index.SnapshotPath()
 	if request.Path != "" {
 		path = request.Path
 	}
@@ -333,17 +500,38 @@ func (s *Server) restore(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method must be POST")
 		return
 	}
-	if s.Index == nil {
-		writeError(w, http.StatusNotImplemented, "restore requires the local backend")
-		return
-	}
-	path := s.Index.SnapshotPath()
 	var request struct {
-		Path string `json:"path"`
+		Path        string `json:"path"`
+		Repository  string `json:"repository"`
+		Snapshot    string `json:"snapshot"`
+		SourceIndex string `json:"source_index"`
+		TargetIndex string `json:"target_index"`
 	}
 	if r.Body != nil {
 		_ = json.NewDecoder(r.Body).Decode(&request)
 	}
+	if remote, ok := s.Backend.(interface {
+		Restore(context.Context, string, string, string, string) error
+	}); ok {
+		if request.Repository == "" || request.Snapshot == "" {
+			writeError(w, http.StatusBadRequest, "repository and snapshot are required for a remote restore")
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+		defer cancel()
+		if err := remote.Restore(ctx, request.Repository, request.Snapshot, request.SourceIndex, request.TargetIndex); err != nil {
+			writeError(w, http.StatusBadGateway, "restore: "+err.Error())
+			return
+		}
+		s.invalidateCache()
+		writeJSON(w, http.StatusOK, map[string]any{"repository": request.Repository, "snapshot": request.Snapshot})
+		return
+	}
+	if s.Index == nil {
+		writeError(w, http.StatusNotImplemented, "restore requires a local backend or configured OpenSearch repository")
+		return
+	}
+	path := s.Index.SnapshotPath()
 	if request.Path != "" {
 		path = request.Path
 	}
@@ -352,6 +540,7 @@ func (s *Server) restore(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "restore: "+err.Error())
 		return
 	}
+	s.invalidateCache()
 	writeJSON(w, http.StatusOK, map[string]any{"restored": path, "documents": count})
 }
 
@@ -389,16 +578,63 @@ func writeError(w http.ResponseWriter, status int, message string) {
 func requestLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
-		next.ServeHTTP(w, r)
-		_ = started
+		requestID := requestID(r)
+		w.Header().Set("X-Request-ID", requestID)
+		recorder := &responseRecorder{ResponseWriter: w}
+		next.ServeHTTP(recorder, r)
+		status := recorder.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		log.Printf("lattice request_id=%s method=%s path=%s status=%d bytes=%d duration_ms=%.3f", requestID, r.Method, r.URL.Path, status, recorder.bytes, float64(time.Since(started).Microseconds())/1000)
 	})
+}
+
+type responseRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+}
+
+func (r *responseRecorder) WriteHeader(status int) {
+	if r.status != 0 {
+		return
+	}
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *responseRecorder) Write(data []byte) (int, error) {
+	if r.status == 0 {
+		r.WriteHeader(http.StatusOK)
+	}
+	n, err := r.ResponseWriter.Write(data)
+	r.bytes += n
+	return n, err
+}
+
+func requestID(r *http.Request) string {
+	value := strings.TrimSpace(r.Header.Get("X-Request-ID"))
+	if value != "" && len(value) <= 128 {
+		valid := true
+		for _, character := range value {
+			if !(unicode.IsLetter(character) || unicode.IsDigit(character) || strings.ContainsRune("-_.:", character)) {
+				valid = false
+				break
+			}
+		}
+		if valid {
+			return value
+		}
+	}
+	return fmt.Sprintf("lattice-%d", requestSequence.Add(1))
 }
 
 const openapiSpec = `openapi: 3.0.3
 info:
   title: LATTICE Search API
   version: 0.1.0
-  description: Hybrid search with honest shard coverage and deadlines.
+  description: Hybrid search with honest shard coverage and deadlines. Configure LATTICE_API_KEY and send it as X-API-Key to protect /v1 routes.
 servers:
   - url: http://localhost:8080
 paths:
@@ -414,6 +650,7 @@ paths:
         '200': {description: Service is ready}
   /v1/documents:
     post:
+      security: [{ApiKeyAuth: []}]
       summary: Publish a document through the local ingest adapter
       requestBody:
         required: true
@@ -425,12 +662,15 @@ paths:
         '400': {description: Invalid document}
   /v1/search:
     get:
+      security: [{ApiKeyAuth: []}]
       summary: Hybrid keyword and semantic search
       parameters:
         - {name: q, in: query, required: true, schema: {type: string}}
         - {name: deadline, in: query, schema: {type: string, example: 150ms}}
         - {name: from, in: query, schema: {type: integer, minimum: 0}}
         - {name: size, in: query, schema: {type: integer, minimum: 1, maximum: 100}}
+        - {name: search_after, in: query, description: Opaque continuation cursor returned by a previous search; required for deep pagination, schema: {type: string}}
+        - {name: tag, in: query, description: Require every listed tag; repeat the parameter or use a comma-separated value, schema: {type: array, items: {type: string}}, style: form, explode: true}
       responses:
         '200':
           description: Results with coverage and timings
@@ -439,6 +679,7 @@ paths:
               schema: {$ref: '#/components/schemas/SearchResponse'}
   /v1/debug/shards/{shard}:
     post:
+      security: [{ApiKeyAuth: []}]
       summary: Toggle a local shard failure for testing
       parameters:
         - {name: shard, in: path, required: true, schema: {type: integer}}
@@ -454,20 +695,41 @@ paths:
         '200': {description: Failure mode changed}
   /v1/admin/reindex:
     post:
-      summary: Rebuild the search index and advance the search alias
+      security: [{ApiKeyAuth: []}]
+      summary: Rebuild OpenSearch into a new generation and atomically swap the configured alias
       responses:
         '200': {description: Reindex completed}
+        '502': {description: OpenSearch operation failed}
   /v1/admin/snapshot:
     post:
-      summary: Create a verified local snapshot
+      security: [{ApiKeyAuth: []}]
+      summary: Create a local atomic snapshot or a native OpenSearch repository snapshot
+      requestBody:
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RemoteSnapshotRequest'}
       responses:
         '200': {description: Snapshot completed}
+        '400': {description: Remote snapshots require repository and snapshot names}
+        '502': {description: OpenSearch operation failed}
   /v1/admin/restore:
     post:
-      summary: Restore a local snapshot
+      security: [{ApiKeyAuth: []}]
+      summary: Restore a local snapshot or a native OpenSearch repository snapshot
+      requestBody:
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/RemoteRestoreRequest'}
       responses:
         '200': {description: Restore completed}
+        '400': {description: Remote restores require repository and snapshot names}
+        '502': {description: OpenSearch operation failed}
 components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
   schemas:
     Document:
       type: object
@@ -477,10 +739,25 @@ components:
         title: {type: string}
         body: {type: string}
         tags: {type: array, items: {type: string}}
+    RemoteSnapshotRequest:
+      type: object
+      properties:
+        path: {type: string, description: Local snapshot path}
+        repository: {type: string, description: OpenSearch snapshot repository}
+        snapshot: {type: string, description: OpenSearch snapshot name}
+    RemoteRestoreRequest:
+      type: object
+      properties:
+        path: {type: string, description: Local snapshot path}
+        repository: {type: string, description: OpenSearch snapshot repository}
+        snapshot: {type: string, description: OpenSearch snapshot name}
+        source_index: {type: string, description: Concrete index stored in the snapshot}
+        target_index: {type: string, description: Concrete index to restore to before attaching the read alias}
     SearchResponse:
       type: object
       properties:
         results: {type: array, items: {type: object}}
+        next_cursor: {type: string, description: Opaque cursor for the next page when more results are available}
         cache_hit: {type: boolean}
         coverage:
           type: object

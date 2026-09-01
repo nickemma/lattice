@@ -34,6 +34,20 @@ spec:
               value: http://lattice-search-cluster-master:9200
             - name: OPENSEARCH_INDEX
               value: lattice-documents
+            - name: OPENSEARCH_ALIAS
+              value: lattice-documents-read
+            - name: OPENSEARCH_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: lattice-opensearch-auth
+                  key: username
+                  optional: true
+            - name: OPENSEARCH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: lattice-opensearch-auth
+                  key: password
+                  optional: true
             - name: KAFKA_BROKERS
               value: lattice-kafka:9092
             - name: KAFKA_TOPIC

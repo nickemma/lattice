@@ -1,0 +1,8 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../k8s
+patches:
+  - path: query-tls.patch.yaml
+  - path: indexer-tls.patch.yaml
+  - path: operations-tls.patch.yaml

@@ -1,5 +1,8 @@
+# Reference manifest for the Terraform-owned OpenSearch cluster. It is kept
+# beside the GitOps resources for review, but intentionally omitted from the
+# kustomization so Terraform and Argo CD do not fight over the same object.
 # Requires the OpenSearch Kubernetes Operator to be installed in the cluster.
-apiVersion: opensearch.opster.io/v1
+apiVersion: opensearch.org/v1
 kind: OpenSearchCluster
 metadata:
   name: lattice-search
@@ -9,14 +12,22 @@ spec:
     version: 2.17.1
     httpPort: 9200
     vendor: opensearch
+    serviceName: lattice-search-cluster-master
+    additionalConfig:
+      plugins.security.disabled: "true"
   dashboards:
     enable: false
+    replicas: 0
+    version: 2.17.1
+  # The base reference is a non-TLS development profile. Terraform adds the
+  # security block, credentials, bootstrap password, and generated transport
+  # certificates only when opensearch_http_tls=true.
   nodePools:
     - component: masters
       replicas: 3
       diskSize: 30Gi
       roles:
-        - "master"
+        - "cluster_manager"
         - "data"
       resources:
         requests:

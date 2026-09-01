@@ -102,16 +102,16 @@ Then harden it: mTLS everywhere, default-deny network policies, non-root contain
 
 ## Done means
 
-- [ ] A storage engine that provably loses no acknowledged write across a hundred `kill -9` runs
-- [ ] Raft passing its full test suite a hundred consecutive times
-- [ ] Election-time distribution across fifty leader kills, plotted
-- [ ] One million documents indexed, hybrid search returning in a stated p99
-- [ ] p99 measured *during* a segment merge, not just at rest
-- [ ] Partial results reported honestly when shards are unreachable
+- [x] A storage engine that provably loses no acknowledged write across a hundred `kill -9` runs
+- [x] Raft passing its full test suite a hundred consecutive times
+- [x] Election-time distribution across fifty leader kills, plotted
+- [x] One million documents indexed, hybrid search returning in a stated p99
+- [x] p99 measured *during* a segment merge, not just at rest
+- [x] Partial results reported honestly when shards are unreachable
 - [ ] Deployed by Terraform and Argo CD, not by hand
 - [ ] Survived the week-26 chaos day with documented behaviour for each failure
-- [ ] Snapshot restore timed and written into the runbook
-- [ ] `THREAT_MODEL.md` · `RUNBOOK.md` · `BENCHMARKS.md` · one published postmortem
+- [x] Snapshot restore timed and written into the runbook
+- [x] `THREAT_MODEL.md` · `RUNBOOK.md` · `BENCHMARKS.md` · one published postmortem
 - [ ] Ready to serve as Tessera's retrieval tier in week 44
 
 ---

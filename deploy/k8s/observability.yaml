@@ -83,6 +83,14 @@ spec:
           annotations:
             summary: LATTICE query p99 is above the 200ms target
             description: Investigate shard latency, OpenSearch merges, and JVM pressure.
+        - alert: LatticeSnapshotTooOld
+          expr: (time() - kube_cronjob_status_last_success_time{namespace="lattice",cronjob="lattice-snapshot"} > 28800) or absent(kube_cronjob_status_last_success_time{namespace="lattice",cronjob="lattice-snapshot"})
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: LATTICE snapshot is older than eight hours
+            description: Check the snapshot CronJob, repository credentials, and OpenSearch snapshot failures.
 ---
 apiVersion: v1
 kind: ConfigMap

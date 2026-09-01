@@ -41,3 +41,29 @@ func TestPartitionCannotCommit(t *testing.T) {
 		t.Fatalf("partition result = %v", err)
 	}
 }
+
+func TestLeaderKillRecoveryRepeated(t *testing.T) {
+	for run := 0; run < 100; run++ {
+		cluster := raft.NewCluster(1, 2, 3)
+		if err := cluster.ElectLeader(1); err != nil {
+			t.Fatalf("run %d elect initial leader: %v", run, err)
+		}
+		if _, err := cluster.Propose(raft.Command{Key: "before", Value: "ok"}); err != nil {
+			t.Fatalf("run %d initial proposal: %v", run, err)
+		}
+		if err := cluster.Kill(1); err != nil {
+			t.Fatalf("run %d kill leader: %v", run, err)
+		}
+		if err := cluster.ElectLeader(2); err != nil {
+			t.Fatalf("run %d elect replacement: %v", run, err)
+		}
+		if _, err := cluster.Propose(raft.Command{Key: "after", Value: "ok"}); err != nil {
+			t.Fatalf("run %d replacement proposal: %v", run, err)
+		}
+		for _, id := range []int{2, 3} {
+			if value, ok, _ := cluster.Read(id, "after"); !ok || value != "ok" {
+				t.Fatalf("run %d node %d lost committed value", run, id)
+			}
+		}
+	}
+}

@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lattice-indexer
+  namespace: lattice
+spec:
+  template:
+    spec:
+      containers:
+        - name: indexer
+          env:
+            - name: OPENSEARCH_URL
+              value: https://lattice-search-cluster-master:9200
+            - name: OPENSEARCH_CA_FILE
+              value: /etc/lattice/opensearch/ca.crt
+            - name: OPENSEARCH_CLIENT_CERT_FILE
+              value: /etc/lattice/opensearch-client/tls.crt
+            - name: OPENSEARCH_CLIENT_KEY_FILE
+              value: /etc/lattice/opensearch-client/tls.key
+          volumeMounts:
+            - name: opensearch-ca
+              mountPath: /etc/lattice/opensearch
+              readOnly: true
+            - name: opensearch-client
+              mountPath: /etc/lattice/opensearch-client
+              readOnly: true
+      volumes:
+        - name: opensearch-ca
+          secret:
+            secretName: lattice-opensearch-mtls
+            items:
+              - key: ca.crt
+                path: ca.crt
+        - name: opensearch-client
+          secret:
+            secretName: lattice-opensearch-mtls

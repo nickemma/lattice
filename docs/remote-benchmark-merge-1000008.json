@@ -1,0 +1,16 @@
+{
+  "url": "http://localhost:8080",
+  "query": "distributed consensus",
+  "queries": 10000,
+  "concurrency": 32,
+  "completed": 10000,
+  "http_failures": 0,
+  "incomplete_responses": 64,
+  "api_error_responses": 64,
+  "p50_ms": 24.686875999999998,
+  "p95_ms": 53.27043944999997,
+  "p99_ms": 95.54999508000041,
+  "duration_seconds": 10.655035406,
+  "queries_per_second": 938.523394710529,
+  "started_at": "2026-08-31T17:31:23Z"
+}

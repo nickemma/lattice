@@ -9,7 +9,11 @@ spec:
       app: lattice-query
   policyTypes: [Ingress, Egress]
   ingress:
-    - ports:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: lattice
+      ports:
         - protocol: TCP
           port: 8080
   egress:
@@ -24,6 +28,51 @@ spec:
           port: 6379
         - protocol: TCP
           port: 9200
+        - protocol: TCP
+          port: 8000
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lattice-indexer-traffic
+  namespace: lattice
+spec:
+  podSelector:
+    matchLabels:
+      app: lattice-indexer
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: lattice
+      ports:
+        - protocol: TCP
+          port: 9091
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: lattice
+      ports:
+        - protocol: TCP
+          port: 9092
+        - protocol: TCP
+          port: 9200
+        - protocol: TCP
+          port: 8000
     - to:
         - namespaceSelector:
             matchLabels:

@@ -95,11 +95,19 @@ results, coverage := fuse(collectReady(ctx, bm25, vec))
 
 **Coverage is computed, not assumed.** OpenSearch reports `_shards.successful` and `_shards.total` per response; the query service surfaces those rather than discarding them. This is the mechanism behind `"complete": false`.
 
-**Pagination is bounded.** Deep `from`/`size` paging makes every shard sort and return `from + size` documents — at `from=10000` that is a cluster memory incident. Past a threshold, `search_after` is required. The cap is enforced at the API, not documented as a guideline.
+Every HTTP response carries an `X-Request-ID`. Callers may provide a short
+safe value for cross-service correlation; otherwise the API generates one and
+logs method, path, status, bytes, and duration. This makes a degraded query
+traceable from the client response to the service log without exposing raw
+request headers.
+
+**Pagination is bounded.** Deep `from`/`size` paging makes every shard sort and return `from + size` documents — at `from=10000` that is a cluster memory incident. Past a threshold, `search_after` is required. The API returns an opaque, query-bound `next_cursor`; clients pass it back unchanged. The cap is enforced at the API, not documented as a guideline.
 
 ---
 
 ## 6. Zero-downtime reindex
+
+The local backend has a verified atomic replacement path exposed through the admin API. When `OPENSEARCH_ALIAS` is configured, the remote adapter creates a new generation, runs `_reindex`, and swaps the alias in one `_aliases` request. Snapshot and restore requests delegate to an OpenSearch repository; the repository and restore target are explicit API inputs. A real scratch-cluster restore drill is still required before making an RTO claim.
 
 Mappings are largely immutable. Changing an analyzer means a new index.
 
@@ -126,7 +134,7 @@ Three things, in order of how often they are the answer:
 
 **Unbounded queries.** Deep pagination, huge aggregations, and wildcard-leading terms are the usual culprits. Guard at the API layer; the cluster's own breakers are the last line, not the first.
 
-Each of these gets a runbook section with the signal, the confirmation query, and the action.
+Each of these gets a runbook section with the signal, the confirmation query, and the action. Prometheus metrics and Grafana dashboards are implemented now; distributed tracing is intentionally a later hardening increment rather than an undocumented dependency.
 
 ---
 

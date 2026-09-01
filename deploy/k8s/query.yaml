@@ -29,16 +29,40 @@ spec:
           env:
             - name: LATTICE_ADDR
               value: ":8080"
+            - name: LATTICE_MAX_INFLIGHT_QUERIES
+              value: "128"
             - name: LATTICE_DATA_DIR
               value: /var/lib/lattice
             - name: OPENSEARCH_URL
               value: http://lattice-search-cluster-master:9200
+            - name: OPENSEARCH_INDEX
+              value: lattice-documents
+            - name: OPENSEARCH_ALIAS
+              value: lattice-documents-read
+            - name: OPENSEARCH_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: lattice-opensearch-auth
+                  key: username
+                  optional: true
+            - name: OPENSEARCH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: lattice-opensearch-auth
+                  key: password
+                  optional: true
             - name: KAFKA_BROKERS
               value: lattice-kafka:9092
             - name: REDIS_URL
               value: redis://lattice-redis:6379/0
             - name: EMBEDDING_URL
               value: ""
+            - name: LATTICE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: lattice-api-key
+                  key: value
+                  optional: true
           readinessProbe:
             httpGet: {path: /readyz, port: http}
           livenessProbe:

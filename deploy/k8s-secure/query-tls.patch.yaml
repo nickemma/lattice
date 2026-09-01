@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lattice-query
+  namespace: lattice
+spec:
+  template:
+    spec:
+      containers:
+        - name: query
+          env:
+            - name: OPENSEARCH_URL
+              value: https://lattice-search-cluster-master:9200
+            - name: OPENSEARCH_CA_FILE
+              value: /etc/lattice/opensearch/ca.crt
+            - name: OPENSEARCH_CLIENT_CERT_FILE
+              value: /etc/lattice/opensearch-client/tls.crt
+            - name: OPENSEARCH_CLIENT_KEY_FILE
+              value: /etc/lattice/opensearch-client/tls.key
+            - name: LATTICE_TLS_CERT_FILE
+              value: /etc/lattice/api-tls/tls.crt
+            - name: LATTICE_TLS_KEY_FILE
+              value: /etc/lattice/api-tls/tls.key
+            - name: LATTICE_TLS_CA_FILE
+              value: /etc/lattice/api-tls/ca.crt
+          readinessProbe:
+            httpGet:
+              scheme: HTTPS
+          livenessProbe:
+            httpGet:
+              scheme: HTTPS
+          volumeMounts:
+            - name: api-tls
+              mountPath: /etc/lattice/api-tls
+              readOnly: true
+            - name: opensearch-ca
+              mountPath: /etc/lattice/opensearch
+              readOnly: true
+            - name: opensearch-client
+              mountPath: /etc/lattice/opensearch-client
+              readOnly: true
+      volumes:
+        - name: api-tls
+          secret:
+            secretName: lattice-query-tls
+        - name: opensearch-ca
+          secret:
+            secretName: lattice-opensearch-mtls
+            items:
+              - key: ca.crt
+                path: ca.crt
+        - name: opensearch-client
+          secret:
+            secretName: lattice-opensearch-mtls

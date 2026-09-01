@@ -9,6 +9,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
+	"strconv"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -31,6 +34,8 @@ type metrics struct {
 	batches   atomic.Uint64
 	retries   atomic.Uint64
 	lagMillis atomic.Int64
+	lagMu     sync.RWMutex
+	lagByPart map[int]int64
 }
 
 func (m *metrics) handler(w http.ResponseWriter, _ *http.Request) {
@@ -39,7 +44,18 @@ func (m *metrics) handler(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(w, "# TYPE lattice_ingest_dlq_total counter\nlattice_ingest_dlq_total %d\n", m.dlq.Load())
 	fmt.Fprintf(w, "# TYPE lattice_ingest_batches_total counter\nlattice_ingest_batches_total %d\n", m.batches.Load())
 	fmt.Fprintf(w, "# TYPE lattice_ingest_retries_total counter\nlattice_ingest_retries_total %d\n", m.retries.Load())
-	fmt.Fprintf(w, "# TYPE lattice_ingest_lag_seconds gauge\nlattice_ingest_lag_seconds %.3f\n", float64(m.lagMillis.Load())/1000)
+	fmt.Fprintln(w, "# TYPE lattice_ingest_lag_seconds gauge")
+	m.lagMu.RLock()
+	partitions := make([]int, 0, len(m.lagByPart))
+	for partition := range m.lagByPart {
+		partitions = append(partitions, partition)
+	}
+	sort.Ints(partitions)
+	for _, partition := range partitions {
+		fmt.Fprintf(w, "lattice_ingest_lag_seconds{partition=\"%s\"} %.3f\n", strconv.Itoa(partition), float64(m.lagByPart[partition])/1000)
+	}
+	m.lagMu.RUnlock()
+	fmt.Fprintf(w, "lattice_ingest_lag_seconds %.3f\n", float64(m.lagMillis.Load())/1000)
 }
 
 type bulkIndexer interface {
@@ -60,8 +76,25 @@ func main() {
 		if embeddingURL := os.Getenv("EMBEDDING_URL"); embeddingURL != "" {
 			embedder = embedding.New(embeddingURL)
 		}
-		remoteBackend := opensearch.NewBackendWithEmbedder(opensearch.New(remoteURL), indexName, embedder)
-		waitContext, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		client := opensearch.New(remoteURL)
+		client.Username = os.Getenv("OPENSEARCH_USERNAME")
+		client.Password = os.Getenv("OPENSEARCH_PASSWORD")
+		caFile := os.Getenv("OPENSEARCH_CA_FILE")
+		clientCertFile := os.Getenv("OPENSEARCH_CLIENT_CERT_FILE")
+		clientKeyFile := os.Getenv("OPENSEARCH_CLIENT_KEY_FILE")
+		if caFile != "" || clientCertFile != "" || clientKeyFile != "" {
+			if err := client.ConfigureTLS(caFile, clientCertFile, clientKeyFile); err != nil {
+				log.Fatal(err)
+			}
+		}
+		alias := os.Getenv("OPENSEARCH_ALIAS")
+		var remoteBackend *opensearch.Backend
+		if alias == "" {
+			remoteBackend = opensearch.NewBackendWithEmbedder(client, indexName, embedder)
+		} else {
+			remoteBackend = opensearch.NewBackendWithAliasAndEmbedder(client, indexName, alias, embedder)
+		}
+		waitContext, cancel := context.WithTimeout(context.Background(), dependencyTimeout())
 		if err := remoteBackend.WaitForIndex(waitContext); err != nil {
 			cancel()
 			log.Fatal(err)
@@ -88,7 +121,7 @@ func main() {
 	defer dlq.Close()
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
-	indexerMetrics := &metrics{}
+	indexerMetrics := &metrics{lagByPart: make(map[int]int64)}
 	metricsServer := &http.Server{Addr: env("LATTICE_INDEXER_ADDR", ":9091"), Handler: http.HandlerFunc(indexerMetrics.handler)}
 	go func() {
 		if err := metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -173,7 +206,14 @@ func processBatch(ctx context.Context, consumer *kafka.Consumer, dlq *kafka.Prod
 			if lag < 0 {
 				lag = 0
 			}
-			telemetry.lagMillis.Store(lag.Milliseconds())
+			lagMillis := lag.Milliseconds()
+			telemetry.lagMillis.Store(lagMillis)
+			telemetry.lagMu.Lock()
+			if telemetry.lagByPart == nil {
+				telemetry.lagByPart = make(map[int]int64)
+			}
+			telemetry.lagByPart[message.Partition] = lagMillis
+			telemetry.lagMu.Unlock()
 		}
 	}
 	validMessages := make([]kafkaapi.Message, 0, len(messages))
@@ -279,4 +319,18 @@ func env(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func dependencyTimeout() time.Duration {
+	const fallback = 10 * time.Minute
+	raw := os.Getenv("LATTICE_DEPENDENCY_TIMEOUT")
+	if raw == "" {
+		return fallback
+	}
+	duration, err := time.ParseDuration(raw)
+	if err != nil || duration <= 0 {
+		log.Printf("invalid LATTICE_DEPENDENCY_TIMEOUT %q; using %s", raw, fallback)
+		return fallback
+	}
+	return duration
 }

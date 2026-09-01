@@ -1,0 +1,15 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lattice-default-deny
+  namespace: lattice
+spec:
+  # Scope the baseline to LATTICE application pods. Operator-managed
+  # OpenSearch pods have their own cluster transport requirements and must not
+  # be accidentally isolated by an application policy.
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: [lattice-query, lattice-indexer]
+  policyTypes: [Ingress, Egress]

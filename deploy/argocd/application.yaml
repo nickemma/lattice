@@ -17,4 +17,5 @@ spec:
       prune: true
       selfHeal: true
     syncOptions:
-      - CreateNamespace=true
+      # Terraform owns the namespace; Argo owns the resources inside it.
+      - ApplyOutOfSyncOnly=true

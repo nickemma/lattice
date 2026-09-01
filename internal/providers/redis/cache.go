@@ -41,6 +41,8 @@ func (c *Cache) Set(ctx context.Context, key string, value []byte) error {
 	return c.client.Set(ctx, key, value, c.ttl).Err()
 }
 
+func (c *Cache) Clear(ctx context.Context) error { return c.client.FlushDB(ctx).Err() }
+
 func (c *Cache) Ready(ctx context.Context) error { return c.client.Ping(ctx).Err() }
 
 func (c *Cache) Close() error { return c.client.Close() }

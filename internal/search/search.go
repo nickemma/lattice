@@ -2,6 +2,7 @@ package search
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -44,17 +45,59 @@ type Timings struct {
 }
 
 type Response struct {
-	Results  []Result `json:"results"`
-	Coverage Coverage `json:"coverage"`
-	Timings  Timings  `json:"timings_ms"`
-	Errors   []string `json:"errors,omitempty"`
-	CacheHit bool     `json:"cache_hit,omitempty"`
+	Results    []Result `json:"results"`
+	NextCursor string   `json:"next_cursor,omitempty"`
+	Coverage   Coverage `json:"coverage"`
+	Timings    Timings  `json:"timings_ms"`
+	Errors     []string `json:"errors,omitempty"`
+	CacheHit   bool     `json:"cache_hit,omitempty"`
 }
 
 type Backend interface {
 	Upsert(Document) error
 	Count() int
 	Search(context.Context, string, int, int) Response
+}
+
+// FilteredBackend is an optional extension used when a backend can apply
+// structured filters at the shard rather than filtering results in the API.
+// Backend remains intentionally small so teaching and test doubles stay easy
+// to implement.
+type FilteredBackend interface {
+	SearchWithFilters(context.Context, string, []string, int, int) Response
+}
+
+// CursorBackend is the continuation form of FilteredBackend. The token is
+// opaque to callers; the backend owns how it resumes a stable result stream.
+type CursorBackend interface {
+	SearchWithFiltersCursor(context.Context, string, []string, string, int) Response
+}
+
+type Cursor struct {
+	Query  string   `json:"query"`
+	Tags   []string `json:"tags,omitempty"`
+	Size   int      `json:"size"`
+	Offset int      `json:"offset"`
+}
+
+func EncodeCursor(cursor Cursor) string {
+	payload, _ := json.Marshal(cursor)
+	return base64.RawURLEncoding.EncodeToString(payload)
+}
+
+func DecodeCursor(token string) (Cursor, error) {
+	payload, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return Cursor{}, fmt.Errorf("invalid cursor encoding")
+	}
+	var cursor Cursor
+	if err := json.Unmarshal(payload, &cursor); err != nil {
+		return Cursor{}, fmt.Errorf("invalid cursor payload")
+	}
+	if cursor.Size < 1 || cursor.Size > 100 || cursor.Offset < 0 || cursor.Query == "" {
+		return Cursor{}, fmt.Errorf("invalid cursor values")
+	}
+	return cursor, nil
 }
 
 func EmbedText(text string) []float64 { return embed(text) }
@@ -320,6 +363,25 @@ func (i *Index) SetShardDelay(shard int, delay time.Duration) {
 }
 
 func (i *Index) Search(ctx context.Context, query string, from, size int) Response {
+	return i.SearchWithFilters(ctx, query, nil, from, size)
+}
+
+func (i *Index) SearchWithFilters(ctx context.Context, query string, tags []string, from, size int) Response {
+	return i.searchWithFilters(ctx, query, tags, from, size, true)
+}
+
+func (i *Index) SearchWithFiltersCursor(ctx context.Context, query string, tags []string, token string, size int) Response {
+	cursor, err := DecodeCursor(token)
+	if err != nil {
+		return Response{Errors: []string{err.Error()}}
+	}
+	if cursor.Query != query || !sameTags(cursor.Tags, tags) || cursor.Size != size {
+		return Response{Errors: []string{"cursor does not match query, filters, or page size"}}
+	}
+	return i.searchWithFilters(ctx, query, tags, cursor.Offset, size, true)
+}
+
+func (i *Index) searchWithFilters(ctx context.Context, query string, tags []string, from, size int, cursorEnabled bool) Response {
 	started := time.Now()
 	if size <= 0 {
 		size = 10
@@ -327,7 +389,7 @@ func (i *Index) Search(ctx context.Context, query string, from, size int) Respon
 	if from < 0 {
 		from = 0
 	}
-	cacheKey := query + "\x00" + string(rune(from)) + "\x00" + string(rune(size))
+	cacheKey := query + "\x00" + strings.Join(tags, "\x1f") + "\x00" + string(rune(from)) + "\x00" + string(rune(size))
 	i.mu.RLock()
 	if cached, ok := i.cache[cacheKey]; ok && time.Now().Before(i.cacheExpiry[cacheKey]) {
 		i.mu.RUnlock()
@@ -341,7 +403,9 @@ func (i *Index) Search(ctx context.Context, query string, from, size int) Respon
 	for n, shard := range i.shards {
 		shards[n] = make(map[string]Document, len(shard))
 		for id, doc := range shard {
-			shards[n][id] = doc
+			if matchesTags(doc, tags) {
+				shards[n][id] = doc
+			}
 		}
 	}
 	i.mu.RUnlock()
@@ -412,14 +476,18 @@ func (i *Index) Search(ctx context.Context, query string, from, size int) Respon
 	resp.Timings.BM25 = float64(bm25Elapsed.Microseconds()) / 1000
 	resp.Timings.Vector = float64(vectorElapsed.Microseconds()) / 1000
 	resp.Results = fuse(allBM25, allVector)
-	if from >= len(resp.Results) {
+	totalResults := len(resp.Results)
+	if from >= totalResults {
 		resp.Results = nil
 	} else {
 		end := from + size
-		if end > len(resp.Results) {
-			end = len(resp.Results)
+		if end > totalResults {
+			end = totalResults
 		}
 		resp.Results = resp.Results[from:end]
+		if cursorEnabled && end < totalResults && resp.Coverage.Complete && len(resp.Errors) == 0 {
+			resp.NextCursor = EncodeCursor(Cursor{Query: query, Tags: append([]string(nil), tags...), Size: size, Offset: end})
+		}
 	}
 	resp.Timings.Fuse = float64(time.Since(started).Microseconds()) / 1000
 	if resp.Coverage.Complete && len(resp.Errors) == 0 {
@@ -429,6 +497,34 @@ func (i *Index) Search(ctx context.Context, query string, from, size int) Respon
 		i.mu.Unlock()
 	}
 	return resp
+}
+
+func sameTags(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for n := range left {
+		if left[n] != right[n] {
+			return false
+		}
+	}
+	return true
+}
+
+func matchesTags(doc Document, required []string) bool {
+	if len(required) == 0 {
+		return true
+	}
+	seen := make(map[string]struct{}, len(doc.Tags))
+	for _, tag := range doc.Tags {
+		seen[strings.ToLower(tag)] = struct{}{}
+	}
+	for _, tag := range required {
+		if _, ok := seen[strings.ToLower(strings.TrimSpace(tag))]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (i *Index) shard(id string) int {

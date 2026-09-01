@@ -2,12 +2,12 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: lattice
 resources:
-  - namespace.yaml
   - kafka.yaml
   - redis.yaml
   - observability.yaml
+  - operations.yaml
   - rbac.yaml
+  - default-deny.yaml
   - networkpolicy.yaml
-  - opensearch.yaml
   - query.yaml
   - indexer.yaml

@@ -17,31 +17,29 @@ spec:
     spec:
       securityContext:
         runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
       containers:
         - name: kafka
-          image: bitnami/kafka:3.8
+          image: docker.redpanda.com/redpandadata/redpanda:v24.3.8
+          command: ["/entrypoint.sh"]
+          args:
+            - redpanda
+            - start
+            - --mode
+            - dev-container
+            - --smp
+            - "1"
+            - --kafka-addr
+            - internal://0.0.0.0:9092
+            - --advertise-kafka-addr
+            - internal://lattice-kafka:9092
+            - --advertise-rpc-addr
+            - lattice-kafka:33145
           ports:
             - name: kafka
               containerPort: 9092
-          env:
-            - name: KAFKA_CFG_NODE_ID
-              value: "0"
-            - name: KAFKA_CFG_PROCESS_ROLES
-              value: broker,controller
-            - name: KAFKA_CFG_CONTROLLER_QUORUM_VOTERS
-              value: 0@localhost:9093
-            - name: KAFKA_CFG_LISTENERS
-              value: PLAINTEXT://:9092,CONTROLLER://:9093
-            - name: KAFKA_CFG_ADVERTISED_LISTENERS
-              value: PLAINTEXT://lattice-kafka:9092
-            - name: KAFKA_CFG_CONTROLLER_LISTENER_NAMES
-              value: CONTROLLER
-            - name: KAFKA_CFG_INTER_BROKER_LISTENER_NAME
-              value: PLAINTEXT
-            - name: KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE
-              value: "true"
-            - name: ALLOW_PLAINTEXT_LISTENER
-              value: "yes"
           readinessProbe:
             tcpSocket: {port: kafka}
             initialDelaySeconds: 10

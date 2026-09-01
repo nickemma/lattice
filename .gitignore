@@ -1,0 +1,6 @@
+deploy/terraform/.terraform/
+deploy/terraform/terraform.tfstate
+deploy/terraform/terraform.tfstate.*
+.env
+.env.*
+!.env.example

@@ -7,7 +7,7 @@
 
 **LATTICE is a distributed-systems learning project that becomes a working hybrid search platform.**
 
-The project starts with the hard foundations—durable storage, replication, consensus, and sharding—and ends with one million documents indexed and searched on Kubernetes. It is tested through Swagger UI, an interactive playground, automated integration tests, and deliberately destructive chaos experiments.
+The project starts with the hard foundations—durable storage, replication, consensus, and sharding—and is designed to reach one million documents indexed and searched on Kubernetes. The implemented path is tested through Swagger UI, an interactive playground, automated integration tests, and deliberately destructive chaos experiments.
 
 [Architecture](#architecture) · [Build phases](#build-phases) · [Swagger and playground](#swagger-ui-and-playground) · [Walkthrough](docs/walkthrough.md) · [Project roadmap](docs/lattice.md)
 
@@ -64,7 +64,7 @@ flowchart TB
     K8S -. runs .-> OS
     K8S -. runs .-> API
     ARGO["Argo CD"] -. reconciles .-> K8S
-    OBS["Prometheus · Grafana · OTel"] -. observes .-> OS
+    OBS["Prometheus · Grafana"] -. observes .-> OS
     OBS -. observes .-> API
     CHAOS["Chaos suite"] -. kills · partitions · overloads .-> OS
     CHAOS -. kills · partitions · overloads .-> API
@@ -139,11 +139,11 @@ The detailed curriculum and definition of done are in [`docs/lattice.md`](docs/l
 
 ## Swagger UI and playground
 
-The final product will be testable without writing a client application:
+The product is testable without writing a client application:
 
 - **Swagger UI:** interactive OpenAPI documentation for health, document publishing, search, reindex, and operational endpoints.
 - **Playground:** a guided browser workflow for loading sample documents, running keyword and semantic searches, inspecting coverage and timings, and triggering safe local failure drills.
-- **CLI and curl:** every playground action will have a reproducible command for automation and CI.
+- **CLI and curl:** every playground action has a reproducible command for automation and CI.
 
 The intended local surface is:
 
@@ -155,12 +155,23 @@ The intended local surface is:
 | `/healthz` | Liveness |
 | `/readyz` | Dependency readiness |
 | `/metrics` | Prometheus metrics |
+| `:19091/metrics` in Compose | Indexer lag, batch, retry, and DLQ metrics |
 | `/v1/search` | Hybrid search |
 | `/v1/documents` | Playground-friendly document publishing into the ingest path |
 
 `/v1/documents` is a convenience adapter for local testing. Production ingestion still exercises Kafka, batching, embeddings, backpressure, offsets, and the DLQ.
 
 Follow [`docs/walkthrough.md`](docs/walkthrough.md) for the complete test journey.
+The complete route-level contract is in [`api.md`](api.md). No real secrets
+are checked into the repository: Compose uses development-only inline
+configuration, while Terraform creates Kubernetes Secrets from supplied
+variables. See [`.env.example`](.env.example) and the walkthrough for the
+configuration boundary.
+
+For a Kubernetes deployment with API TLS and OpenSearch mTLS, render the
+required-secret overlay in [`deploy/k8s-secure`](deploy/k8s-secure). The base
+manifests remain suitable for a local development cluster; the secure overlay
+requires certificates and explicit trust roots before it can start.
 
 ## Definition of done
 
@@ -193,7 +204,7 @@ All capacity and cost numbers remain unmeasured until the load tests run. No ben
 
 ```text
 lattice/
-├─ cmd/{indexer,latticectl}/       query service is `cmd/`
+├─ cmd/{indexer,latticectl,latticebench}/       query service is `cmd/`
 ├─ internal/
 │  ├─ ingest/  ├─ search/  ├─ server/
 │  └─ providers/{opensearch,kafka}/
@@ -215,15 +226,17 @@ lattice/
 | [`docs/lattice.md`](docs/lattice.md) | Authoritative six-phase project roadmap |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Runtime architecture and failure boundaries |
 | [`docs/walkthrough.md`](docs/walkthrough.md) | End-to-end Swagger, playground, CLI, and chaos testing walkthrough |
+| [`api.md`](api.md) | Complete HTTP API reference and request/response examples |
 | [`docs/RPD.md`](docs/RPD.md) | Product requirements and acceptance criteria |
 | [`docs/ENGINEERING.md`](docs/ENGINEERING.md) | Search-platform design and operational decisions |
 | [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Incident response and restore procedures |
 | [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) | Assets, trust boundaries, threats, and controls |
-| `docs/benchmarks.md` | Planned capacity, cost, and restore results |
+| [`docs/benchmarks.md`](docs/benchmarks.md) | Measured evidence and remaining capacity, cost, and restore work |
+| [`docs/postmortem-compose-integration.md`](docs/postmortem-compose-integration.md) | Published Compose integration postmortem |
 
 ## Current status
 
-The local end-to-end path is runnable now: WAL/LSM/MVCC storage, replication and Raft teaching modules, sharding, hybrid search, Swagger UI, playground, snapshots, reindexing, metrics, and deterministic chaos tests are implemented. The Compose and Kubernetes manifests provide the production-shaped Kafka/OpenSearch path. One-million-document capacity numbers, real embedding-model measurements, and a production Kubernetes restore drill remain explicit Phase 6 evidence to collect rather than claims made in advance.
+The local end-to-end path is runnable now: WAL/LSM/MVCC storage, replication and Raft teaching modules, sharding, hybrid search, Swagger UI, playground, snapshots, reindexing, metrics, and deterministic chaos tests are implemented. The production-shaped Compose path has now been measured with 1,000,008 searchable documents, full-corpus query percentiles, a concurrent-indexing merge window, and a timed native restore; a fresh Terraform/operator-backed kind deployment also passed publish → Kafka/indexer → hybrid search. See [`docs/benchmarks.md`](docs/benchmarks.md) and the raw reports beside it. Remaining Phase 6 evidence includes real embedding-model measurements, a production scratch-cluster restore, full mTLS/identity controls, Argo reconciliation, and real-cluster chaos results.
 
 ## License
 

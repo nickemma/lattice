@@ -26,3 +26,8 @@ output "namespace" {
   value       = kubernetes_namespace.lattice.metadata[0].name
   description = "Namespace consumed by the Argo CD workload application."
 }
+
+output "opensearch_cluster" {
+  value       = kubernetes_manifest.opensearch_cluster.manifest.metadata.name
+  description = "OpenSearchCluster reconciled by the OpenSearch Kubernetes Operator."
+}

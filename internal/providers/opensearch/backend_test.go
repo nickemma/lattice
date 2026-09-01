@@ -59,3 +59,51 @@ func TestBulkUpsertReturnsPerDocumentOutcomes(t *testing.T) {
 		t.Fatalf("outcomes = %+v", outcomes)
 	}
 }
+
+func TestBackendReindexesAndSwapsAlias(t *testing.T) {
+	client := New("http://opensearch")
+	client.HTTPClient = &http.Client{Transport: roundTripper(func(request *http.Request) (*http.Response, error) {
+		var body string
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/_alias/search":
+			body = `{"lattice-1":{}}`
+		case request.Method == http.MethodPut && strings.HasPrefix(request.URL.Path, "/lattice-"):
+			body = `{}`
+		case request.Method == http.MethodPost && request.URL.Path == "/_reindex":
+			body = `{"total":1,"created":1,"failures":[]}`
+		case request.Method == http.MethodPost && request.URL.Path == "/_aliases":
+			body = `{}`
+		default:
+			t.Fatalf("unexpected request: %s %s", request.Method, request.URL.String())
+		}
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+	backend := NewBackendWithAlias(client, "lattice", "search")
+	report, err := backend.Reindex(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Source != "lattice-1" || report.Alias != "search" || report.Destination == "" {
+		t.Fatalf("report = %+v", report)
+	}
+}
+
+func TestBulkUpsertDualWritesDuringReindex(t *testing.T) {
+	client := New("http://opensearch")
+	bulkCalls := 0
+	client.HTTPClient = &http.Client{Transport: roundTripper(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path != "/_bulk" {
+			t.Fatalf("path = %s", request.URL.Path)
+		}
+		bulkCalls++
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK", Body: io.NopCloser(strings.NewReader(`{"errors":false,"items":[{"index":{"status":201}}]}`))}, nil
+	})}
+	backend := NewBackend(client, "lattice")
+	backend.writeMu.Lock()
+	backend.dualWrite = "lattice-new"
+	backend.writeMu.Unlock()
+	outcomes, err := backend.BulkUpsert(context.Background(), []search.Document{{ID: "one", Title: "One", Body: "body"}})
+	if err != nil || len(outcomes) != 1 || outcomes[0].Status != http.StatusCreated || bulkCalls != 2 {
+		t.Fatalf("outcomes=%+v err=%v bulk_calls=%d", outcomes, err, bulkCalls)
+	}
+}

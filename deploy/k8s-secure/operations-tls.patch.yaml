@@ -1,0 +1,101 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: lattice-snapshot
+  namespace: lattice
+spec:
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: snapshot
+              env:
+                - name: OPENSEARCH_URL
+                  value: https://lattice-search-cluster-master:9200
+                - name: OPENSEARCH_CA_FILE
+                  value: /etc/lattice/opensearch/ca.crt
+                - name: OPENSEARCH_CLIENT_CERT_FILE
+                  value: /etc/lattice/opensearch-client/tls.crt
+                - name: OPENSEARCH_CLIENT_KEY_FILE
+                  value: /etc/lattice/opensearch-client/tls.key
+              args:
+                - >-
+                  name="lattice-$(date -u +%Y%m%dT%H%M%SZ)";
+                  curl --fail-with-body --cacert "$OPENSEARCH_CA_FILE"
+                  --cert "$OPENSEARCH_CLIENT_CERT_FILE"
+                  --key "$OPENSEARCH_CLIENT_KEY_FILE" -X PUT
+                  "$OPENSEARCH_URL/_snapshot/$SNAPSHOT_REPOSITORY/$name?wait_for_completion=true"
+                  -H 'content-type: application/json'
+                  --data '{"indices":"lattice-documents-read","include_global_state":false}'
+              volumeMounts:
+                - name: opensearch-mtls
+                  mountPath: /etc/lattice/opensearch
+                  readOnly: true
+                - name: opensearch-client
+                  mountPath: /etc/lattice/opensearch-client
+                  readOnly: true
+          volumes:
+            - name: opensearch-mtls
+              secret:
+                secretName: lattice-opensearch-mtls
+                items:
+                  - key: ca.crt
+                    path: ca.crt
+            - name: opensearch-client
+              secret:
+                secretName: lattice-opensearch-mtls
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: lattice-restore-drill
+  namespace: lattice
+spec:
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: restore
+              env:
+                - name: RESTORE_URL
+                  value: https://lattice-search-scratch:9200
+                - name: OPENSEARCH_CA_FILE
+                  value: /etc/lattice/opensearch/ca.crt
+                - name: OPENSEARCH_CLIENT_CERT_FILE
+                  value: /etc/lattice/opensearch-client/tls.crt
+                - name: OPENSEARCH_CLIENT_KEY_FILE
+                  value: /etc/lattice/opensearch-client/tls.key
+              args:
+                - >-
+                  started=$(date +%s);
+                  curl --fail-with-body --cacert "$OPENSEARCH_CA_FILE"
+                  --cert "$OPENSEARCH_CLIENT_CERT_FILE"
+                  --key "$OPENSEARCH_CLIENT_KEY_FILE" -X POST
+                  "$RESTORE_URL/_snapshot/$SNAPSHOT_REPOSITORY/$SNAPSHOT_NAME/_restore?wait_for_completion=true"
+                  -H 'content-type: application/json'
+                  --data '{"indices":"lattice-documents-*","include_global_state":false}';
+                  count=$(curl --fail --cacert "$OPENSEARCH_CA_FILE"
+                  --cert "$OPENSEARCH_CLIENT_CERT_FILE"
+                  --key "$OPENSEARCH_CLIENT_KEY_FILE"
+                  "$RESTORE_URL/lattice-documents-*/_count" | tr -cd '0-9');
+                  elapsed=$(($(date +%s)-started));
+                  echo "restore_documents=$count restore_elapsed_seconds=$elapsed"
+              volumeMounts:
+                - name: opensearch-mtls
+                  mountPath: /etc/lattice/opensearch
+                  readOnly: true
+                - name: opensearch-client
+                  mountPath: /etc/lattice/opensearch-client
+                  readOnly: true
+          volumes:
+            - name: opensearch-mtls
+              secret:
+                secretName: lattice-opensearch-mtls
+                items:
+                  - key: ca.crt
+                    path: ca.crt
+            - name: opensearch-client
+              secret:
+                secretName: lattice-opensearch-mtls

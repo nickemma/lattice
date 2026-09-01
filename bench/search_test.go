@@ -3,6 +3,8 @@ package bench
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -11,7 +13,13 @@ import (
 
 func BenchmarkHybridSearch(b *testing.B) {
 	index := search.NewIndex(3)
-	for n := 0; n < 10000; n++ {
+	documents := 10000
+	if value := os.Getenv("LATTICE_BENCH_DOCS"); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil && parsed > 0 {
+			documents = parsed
+		}
+	}
+	for n := 0; n < documents; n++ {
 		index.Upsert(search.Document{
 			ID:    fmt.Sprintf("doc-%06d", n),
 			Title: "distributed systems document",

@@ -2,7 +2,7 @@
 
 **System:** LATTICE — Distributed Search & Retrieval Platform
 **Owner:** Nicholas Emmanuel
-**Status:** Proposed
+**Status:** Building — Compose path verified; production-scale evidence pending
 **Date:** August 2026
 
 **Roadmap scope:** [`docs/lattice.md`](lattice.md) is the authoritative six-phase roadmap. This RPD defines the Phase 5 search product and Phase 6 operational slice, including the developer-facing Swagger UI and playground described in [`docs/walkthrough.md`](walkthrough.md).

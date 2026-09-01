@@ -1,0 +1,174 @@
+# These resources require the OpenSearch Kubernetes Operator CRDs. They keep
+# mappings, lifecycle, and scheduled snapshots reviewable in Git.
+apiVersion: opensearch.org/v1
+kind: OpensearchIndexTemplate
+metadata:
+  name: lattice-documents
+  namespace: lattice
+spec:
+  opensearchCluster:
+    name: lattice-search
+  name: lattice-documents
+  indexPatterns:
+    - "lattice-documents*"
+  priority: 100
+  template:
+    settings:
+      index.knn: true
+      number_of_shards: 3
+      number_of_replicas: 1
+      refresh_interval: 5s
+    mappings:
+      properties:
+        id:
+          type: keyword
+        title:
+          type: text
+        body:
+          type: text
+        tags:
+          type: keyword
+        embedding:
+          type: knn_vector
+          dimension: 64
+---
+apiVersion: opensearch.org/v1
+kind: OpenSearchISMPolicy
+metadata:
+  name: lattice-documents
+  namespace: lattice
+spec:
+  opensearchCluster:
+    name: lattice-search
+  policyId: lattice-documents
+  applyToExistingIndices: true
+  description: Retain LATTICE generations during the rollback window, then delete them.
+  defaultState: hot
+  ismTemplate:
+    indexPatterns:
+      - "lattice-documents*"
+    priority: 100
+  states:
+    - name: hot
+      actions: []
+      transitions:
+        - stateName: delete
+          conditions:
+            minIndexAge: 30d
+    - name: delete
+      actions:
+        - delete: {}
+---
+# The repository must be registered in OpenSearch with S3 credentials before
+# this job is enabled. A CronJob is used here so kube-state-metrics can expose
+# its last successful run for the snapshot-age alert.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: lattice-snapshot
+  namespace: lattice
+  labels:
+    app: lattice-snapshot
+spec:
+  schedule: "17 */6 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      template:
+        metadata:
+          labels:
+            app: lattice-snapshot
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: snapshot
+              image: curlimages/curl:8.10.1
+              env:
+                - name: OPENSEARCH_URL
+                  value: http://lattice-search-cluster-master:9200
+                - name: OPENSEARCH_USERNAME
+                  valueFrom:
+                    secretKeyRef:
+                      name: lattice-opensearch-auth
+                      key: username
+                - name: OPENSEARCH_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: lattice-opensearch-auth
+                      key: password
+                - name: SNAPSHOT_REPOSITORY
+                  value: lattice-s3
+              command: ["/bin/sh", "-ec"]
+              args:
+                - >-
+                  name="lattice-$(date -u +%Y%m%dT%H%M%SZ)";
+                  curl --fail-with-body -u "$OPENSEARCH_USERNAME:$OPENSEARCH_PASSWORD" -X PUT
+                  "$OPENSEARCH_URL/_snapshot/$SNAPSHOT_REPOSITORY/$name?wait_for_completion=true"
+                  -H 'content-type: application/json'
+                  --data '{"indices":"lattice-documents-read","include_global_state":false}'
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: [ALL]}
+---
+# Intentionally suspended until RESTORE_URL points at an empty scratch
+# cluster. Enabling it produces timed restore evidence, not a production
+# restore against the live alias.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: lattice-restore-drill
+  namespace: lattice
+  labels:
+    app: lattice-restore-drill
+spec:
+  suspend: true
+  schedule: "43 3 * * 0"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app: lattice-restore-drill
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: restore
+              image: curlimages/curl:8.10.1
+              env:
+                - name: RESTORE_URL
+                  value: http://lattice-search-scratch:9200
+                - name: OPENSEARCH_USERNAME
+                  valueFrom:
+                    secretKeyRef:
+                      name: lattice-opensearch-auth
+                      key: username
+                - name: OPENSEARCH_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: lattice-opensearch-auth
+                      key: password
+                - name: SNAPSHOT_REPOSITORY
+                  value: lattice-s3
+                - name: SNAPSHOT_NAME
+                  value: latest
+              command: ["/bin/sh", "-ec"]
+              args:
+                - >-
+                  started=$(date +%s);
+                  curl --fail-with-body -u "$OPENSEARCH_USERNAME:$OPENSEARCH_PASSWORD" -X POST
+                  "$RESTORE_URL/_snapshot/$SNAPSHOT_REPOSITORY/$SNAPSHOT_NAME/_restore?wait_for_completion=true"
+                  -H 'content-type: application/json'
+                  --data '{"indices":"lattice-documents-*","include_global_state":false}';
+                  count=$(curl --fail -u "$OPENSEARCH_USERNAME:$OPENSEARCH_PASSWORD" "$RESTORE_URL/lattice-documents-*/_count" | tr -cd '0-9');
+                  elapsed=$(($(date +%s)-started));
+                  echo "restore_documents=$count restore_elapsed_seconds=$elapsed"
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: [ALL]}
