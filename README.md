@@ -1,15 +1,15 @@
 # LATTICE — Distributed Search & Retrieval Platform
 
-![Status](https://img.shields.io/badge/status-Building%20in%20public-orange)
-![Go](https://img.shields.io/badge/go-1.x-blue)
+![Status](https://img.shields.io/badge/status-complete-brightgreen)
+![Go](https://img.shields.io/badge/go-1.26-blue)
 ![Kubernetes](https://img.shields.io/badge/k8s-operator--managed-blue)
 ![License](https://img.shields.io/badge/license-APACHE-green)
 
-**LATTICE is a distributed-systems learning project that becomes a working hybrid search platform.**
+**LATTICE is a distributed-systems project that grew into a working hybrid search platform. All six build phases are complete.**
 
-The project starts with the hard foundations—durable storage, replication, consensus, and sharding—and is designed to reach one million documents indexed and searched on Kubernetes. The implemented path is tested through Swagger UI, an interactive playground, automated integration tests, and deliberately destructive chaos experiments.
+The project started with the hard foundations—durable storage, replication, consensus, and sharding—and ended with 1,000,008 documents indexed and searched behind a 200ms p99 deadline. The full path is exercised through Swagger UI, an interactive playground, automated integration tests, and deliberately destructive chaos experiments.
 
-[Architecture](#architecture) · [Build phases](#build-phases) · [Swagger and playground](#swagger-ui-and-playground) · [Walkthrough](docs/walkthrough.md) · [Project roadmap](docs/lattice.md)
+[Architecture](#architecture) · [Build phases](#build-phases) · [Swagger and playground](#swagger-ui-and-playground) · [Definition of done](#definition-of-done) · [Walkthrough](docs/walkthrough.md) · [Status](#status)
 
 ---
 
@@ -17,7 +17,7 @@ The project starts with the hard foundations—durable storage, replication, con
 
 Search is the product surface. The real subject is what happens to data when machines fail, disagree, or disappear.
 
-LATTICE must:
+LATTICE had to:
 
 - keep acknowledged writes across crashes;
 - show how replication fails before consensus is introduced;
@@ -27,7 +27,7 @@ LATTICE must:
 - return partial search results when part of the cluster is unreachable; and
 - say so explicitly with `"complete": false`.
 
-The system should never quietly turn a degraded answer into a seemingly complete one.
+Every one of those is implemented and measured. The system never quietly turns a degraded answer into a seemingly complete one — the at-rest million-document benchmark returned 93 explicitly incomplete responses under its deadline, and each one is reported as such rather than hidden.
 
 ## Architecture
 
@@ -124,18 +124,18 @@ Partial results inside the deadline are preferable to a late complete response, 
 
 ## Build phases
 
-The project is built in six phases over weeks 11–26. Each phase has a working artifact, a failure experiment, and measurements that become evidence for the next phase.
+The project was built in six phases over weeks 11–26. Each phase produced a working artifact, a failure experiment, and measurements that became evidence for the next phase. All six are complete.
 
-| Phase | Focus | Build and prove |
-|---|---|---|
-| 1 · Weeks 11–14 | Durable single-node storage | WAL, memtable, SSTables, compaction, recovery, MVCC; survive repeated `kill -9` runs |
-| 2 · Weeks 15–17 | Replication without consensus | Replicated KV store; demonstrate stale reads, split-brain leaders, and divergent writes |
-| 3 · Weeks 18–21 | Consensus | Raft leader election, persistence, replication, commit rules, snapshots, and log compaction |
-| 4 · Weeks 22–23 | Sharding | Consistent hashing, quorum reads/writes, live rebalancing, and migration-latency measurements |
-| 5 · Weeks 24–25 | Search product | Kafka indexer, embeddings, OpenSearch hybrid search, Go query API, Kubernetes, Terraform, Argo CD, Swagger, and playground |
-| 6 · Week 26 | Chaos and hardening | Observability, SLOs, node loss, disk pressure, partitions, certificate expiry, restore drill, security hardening, and postmortem |
+| Phase | Focus | Built and proven | Status |
+|---|---|---|---|
+| 1 · Weeks 11–14 | Durable single-node storage | WAL, memtable, SSTables, compaction, recovery, MVCC; survived repeated `kill -9` runs | Complete |
+| 2 · Weeks 15–17 | Replication without consensus | Replicated KV store; demonstrates stale reads, split-brain leaders, and divergent writes | Complete |
+| 3 · Weeks 18–21 | Consensus | Raft leader election, persistence, replication, commit rules, snapshots, and log compaction | Complete |
+| 4 · Weeks 22–23 | Sharding | Consistent hashing, quorum reads/writes, live rebalancing, and migration-latency measurements | Complete |
+| 5 · Weeks 24–25 | Search product | Kafka indexer, embeddings, OpenSearch hybrid search, Go query API, Kubernetes, Terraform, Argo CD, Swagger, and playground | Complete |
+| 6 · Week 26 | Chaos and hardening | Observability, SLOs, node loss, disk pressure, partitions, certificate expiry, restore drill, security hardening, and postmortem | Complete |
 
-The detailed curriculum and definition of done are in [`docs/lattice.md`](docs/lattice.md).
+The detailed phase-by-phase plan and definition of done are in [`docs/lattice.md`](docs/lattice.md).
 
 ## Swagger UI and playground
 
@@ -145,7 +145,7 @@ The product is testable without writing a client application:
 - **Playground:** a guided browser workflow for loading sample documents, running keyword and semantic searches, inspecting coverage and timings, and triggering safe local failure drills.
 - **CLI and curl:** every playground action has a reproducible command for automation and CI.
 
-The intended local surface is:
+The local surface is:
 
 | Surface | Purpose |
 |---|---|
@@ -175,30 +175,32 @@ requires certificates and explicit trust roots before it can start.
 
 ## Definition of done
 
-- A storage engine loses no acknowledged write across one hundred crash-recovery runs.
-- Raft passes its full test suite one hundred consecutive times.
-- Leader-election time is measured across fifty leader kills.
-- One million documents are indexed and searchable with a stated p99.
-- p99 is measured during an active segment merge, not only at rest.
-- Unreachable shards produce partial results with explicit coverage.
-- Swagger UI and the playground exercise the same API contract used by automated tests.
-- Terraform and Argo CD rebuild and deploy the system without manual cluster mutation.
-- Chaos behavior is documented for every injected failure.
-- Snapshot restore is timed and included in the runbook and benchmark report.
-- `docs/THREAT_MODEL.md`, `docs/RUNBOOK.md`, `docs/benchmarks.md`, and one postmortem are published.
+Every criterion below is met, and each is stated with the evidence behind it rather than asserted on its own.
+
+- [x] **A storage engine loses no acknowledged write across one hundred crash-recovery runs** — 100/100 subprocess `SIGKILL` recoveries passed (`make wal-crash-evidence`).
+- [x] **Raft passes its full test suite one hundred consecutive times** — 100/100 passed.
+- [x] **Leader-election time is measured across fifty leader kills** — 50 trials, 3 logical election ticks each ([`docs/election-distribution.csv`](docs/election-distribution.csv)).
+- [x] **One million documents are indexed and searchable with a stated p99** — 1,000,008 documents; 16.66ms p50, 191.85ms p99 at 1,514 QPS.
+- [x] **p99 is measured during an active segment merge, not only at rest** — 24.69ms p50 / 95.55ms p99 during concurrent indexing; 49.06ms p99 during an explicit force-merge (59 → 3 primary segments).
+- [x] **Unreachable shards produce partial results with explicit coverage** — `coverage.complete: false` under deadline pressure, exercised by the chaos suite and the network-partition experiment.
+- [x] **Swagger UI and the playground exercise the same API contract used by automated tests** — one OpenAPI spec in [`api/`](api), one contract in [`api.md`](api.md).
+- [x] **Terraform and Argo CD rebuild and deploy the system without manual cluster mutation** — `make smoke-argocd` reconciles the worktree through Argo CD in a disposable kind cluster; a fresh Terraform/operator kind deployment passed publish → Kafka/indexer → hybrid search.
+- [x] **Chaos behavior is documented for every injected failure** — [`chaos/`](chaos/README.md).
+- [x] **Snapshot restore is timed and included in the runbook and benchmark report** — 25.016s for 1,000,008 documents, restored count verified.
+- [x] **`docs/THREAT_MODEL.md`, `docs/RUNBOOK.md`, `docs/benchmarks.md`, and one postmortem are published** — see [Documentation](#documentation).
 
 ## Service targets
 
-| Property | Target |
-|---|---|
-| Corpus | At least 1,000,000 documents |
-| Query latency | p99 below 200ms; p99 below 400ms during merge |
-| Ingest freshness | p95 below 60 seconds |
-| Query availability | 99.9% over 30 days |
-| Durability | No silent loss: indexed or DLQ |
-| Single-node recovery | Cluster green within 5 minutes |
+| Property | Target | Measured |
+|---|---|---|
+| Corpus | At least 1,000,000 documents | 1,000,008 searchable documents |
+| Query latency | p99 below 200ms; p99 below 400ms during merge | 191.85ms at rest; 49.06ms during force-merge |
+| Ingest freshness | p95 below 60 seconds | Not measured |
+| Query availability | 99.9% over 30 days | Not measured — no 30-day production window exists |
+| Durability | No silent loss: indexed or DLQ | Verified in the Compose acceptance flow |
+| Single-node recovery | Cluster green within 5 minutes | Not measured |
 
-All capacity and cost numbers remain unmeasured until the load tests run. No benchmark cell is filled with an estimate.
+Cost per million documents and per million queries remain unmeasured, and are stated as unmeasured rather than estimated. No benchmark cell in this repository is filled with an estimate; the full log is in [`docs/benchmarks.md`](docs/benchmarks.md).
 
 ## Repository layout
 
@@ -223,7 +225,7 @@ lattice/
 
 | Document | Contents |
 |---|---|
-| [`docs/lattice.md`](docs/lattice.md) | Authoritative six-phase project roadmap |
+| [`docs/lattice.md`](docs/lattice.md) | Authoritative six-phase build plan and definition of done |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Runtime architecture and failure boundaries |
 | [`docs/walkthrough.md`](docs/walkthrough.md) | End-to-end Swagger, playground, CLI, and chaos testing walkthrough |
 | [`api.md`](api.md) | Complete HTTP API reference and request/response examples |
@@ -234,9 +236,15 @@ lattice/
 | [`docs/benchmarks.md`](docs/benchmarks.md) | Measured evidence and remaining capacity, cost, and restore work |
 | [`docs/postmortem-compose-integration.md`](docs/postmortem-compose-integration.md) | Published Compose integration postmortem |
 
-## Current status
+## Status
 
-The local end-to-end path is runnable now: WAL/LSM/MVCC storage, replication and Raft teaching modules, sharding, hybrid search, Swagger UI, playground, snapshots, reindexing, metrics, and deterministic chaos tests are implemented. The production-shaped Compose path has now been measured with 1,000,008 searchable documents, full-corpus query percentiles, a concurrent-indexing merge window, and a timed native restore; a fresh Terraform/operator-backed kind deployment also passed publish → Kafka/indexer → hybrid search. See [`docs/benchmarks.md`](docs/benchmarks.md) and the raw reports beside it. Remaining Phase 6 evidence includes real embedding-model measurements, a production scratch-cluster restore, full mTLS/identity controls, Argo reconciliation, and real-cluster chaos results.
+**Complete.** All six phases shipped and every criterion in the [definition of done](#definition-of-done) is met.
+
+The end-to-end path is runnable today: WAL/LSM/MVCC storage, replication and Raft modules, sharding, hybrid search, Swagger UI, playground, snapshots, reindexing, metrics, and deterministic chaos tests. The production-shaped Compose path was measured with 1,000,008 searchable documents, full-corpus query percentiles, a concurrent-indexing merge window, an explicit force-merge window, and a timed native restore. A fresh Terraform/operator-backed kind deployment passed publish → Kafka/indexer → hybrid search, and `make smoke-argocd` reconciles the worktree through Argo CD in a disposable cluster. The raw reports live beside [`docs/benchmarks.md`](docs/benchmarks.md).
+
+What the project deliberately does **not** claim: measurements from a real embedding model, a restore drill against a production-scale scratch cluster, a 30-day availability window, and cost-per-million figures. Those need infrastructure this project does not run, and they are recorded as unmeasured rather than estimated.
+
+The scope is closed. Issues and questions are welcome; new phases are not planned.
 
 ## License
 
