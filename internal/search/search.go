@@ -31,12 +31,6 @@ type Result struct {
 	Source   string   `json:"source"`
 }
 
-type Coverage struct {
-	ShardsQueried  int  `json:"shards_queried"`
-	ShardsAnswered int  `json:"shards_answered"`
-	Complete       bool `json:"complete"`
-}
-
 type Timings struct {
 	Parse  float64 `json:"parse"`
 	BM25   float64 `json:"bm25"`
@@ -342,6 +336,12 @@ func (i *Index) Restore(path string) (int, error) {
 	return len(snapshot.Documents), nil
 }
 
+// SetShardAvailable is an experiment control, not a production API. It removes
+// a shard from the local in-process fan-out so an availability-driven partial
+// result can be produced deterministically. Any number produced with it is an
+// injected fault and must be labelled as such; it is not an observed node
+// failure. The OpenSearch backend has no equivalent, so results from the two
+// backends are not interchangeable.
 func (i *Index) SetShardAvailable(shard int, available bool) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -352,6 +352,9 @@ func (i *Index) SetShardAvailable(shard int, available bool) {
 	}
 }
 
+// SetShardDelay is an experiment control, not a production API. It stalls a
+// local shard so a deadline-driven partial result can be produced
+// deterministically. See SetShardAvailable for the labelling requirement.
 func (i *Index) SetShardDelay(shard int, delay time.Duration) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -373,10 +376,10 @@ func (i *Index) SearchWithFilters(ctx context.Context, query string, tags []stri
 func (i *Index) SearchWithFiltersCursor(ctx context.Context, query string, tags []string, token string, size int) Response {
 	cursor, err := DecodeCursor(token)
 	if err != nil {
-		return Response{Errors: []string{err.Error()}}
+		return Response{Coverage: RejectedCoverage(), Errors: []string{err.Error()}}
 	}
 	if cursor.Query != query || !sameTags(cursor.Tags, tags) || cursor.Size != size {
-		return Response{Errors: []string{"cursor does not match query, filters, or page size"}}
+		return Response{Coverage: RejectedCoverage(), Errors: []string{"cursor does not match query, filters, or page size"}}
 	}
 	return i.searchWithFilters(ctx, query, tags, cursor.Offset, size, true)
 }
@@ -410,7 +413,7 @@ func (i *Index) searchWithFilters(ctx context.Context, query string, tags []stri
 	}
 	i.mu.RUnlock()
 
-	resp := Response{Coverage: Coverage{ShardsQueried: len(shards)}}
+	resp := Response{}
 	type branchResult struct {
 		shard       int
 		bm25        []Result
@@ -451,6 +454,8 @@ func (i *Index) searchWithFilters(ctx context.Context, query string, tags []stri
 			expected++
 		}
 	}
+	deadlineExceeded := false
+gather:
 	for n := 0; n < expected; n++ {
 		select {
 		case result := <-results:
@@ -464,12 +469,20 @@ func (i *Index) searchWithFilters(ctx context.Context, query string, tags []stri
 			allBM25 = append(allBM25, result.bm25...)
 			allVector = append(allVector, result.vec...)
 		case <-ctx.Done():
+			deadlineExceeded = true
 			resp.Errors = append(resp.Errors, "deadline exceeded while gathering shards")
-			n = len(shards)
+			break gather
 		}
 	}
-	resp.Coverage.ShardsAnswered = answered
-	resp.Coverage.Complete = answered == len(shards)
+	// The in-process index has no external dependency on the read path, so a
+	// missing shard here is always either the deadline or an unavailable shard.
+	// That is what makes it the controlled comparison for the OpenSearch runs.
+	resp.Coverage = EvaluateCoverage(CoverageSignals{
+		ShardsQueried:    len(shards),
+		ShardsAnswered:   answered,
+		ShardsObserved:   true,
+		DeadlineExceeded: deadlineExceeded,
+	})
 	resp.Timings.Parse = float64(time.Since(started).Microseconds()) / 1000
 	sortResults(allBM25)
 	sortResults(allVector)
@@ -485,12 +498,12 @@ func (i *Index) searchWithFilters(ctx context.Context, query string, tags []stri
 			end = totalResults
 		}
 		resp.Results = resp.Results[from:end]
-		if cursorEnabled && end < totalResults && resp.Coverage.Complete && len(resp.Errors) == 0 {
+		if cursorEnabled && end < totalResults && resp.Coverage.Usable() {
 			resp.NextCursor = EncodeCursor(Cursor{Query: query, Tags: append([]string(nil), tags...), Size: size, Offset: end})
 		}
 	}
 	resp.Timings.Fuse = float64(time.Since(started).Microseconds()) / 1000
-	if resp.Coverage.Complete && len(resp.Errors) == 0 {
+	if resp.Coverage.Usable() {
 		i.mu.Lock()
 		i.cache[cacheKey] = resp
 		i.cacheExpiry[cacheKey] = time.Now().Add(30 * time.Second)

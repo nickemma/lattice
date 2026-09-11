@@ -37,6 +37,19 @@ type Server struct {
 	cacheMisses  atomic.Uint64
 	queryNanos   atomic.Uint64
 	queryBuckets [6]atomic.Uint64
+	degraded     atomic.Uint64
+	reasons      map[string]*atomic.Uint64
+}
+
+// coverageReasons is the fixed label set for lattice_query_coverage_reason_total.
+// Every reason is always exported, including at zero, so a dashboard can tell
+// "no deadline expiries" from "this build does not report deadline expiries".
+var coverageReasons = []string{
+	search.ReasonComplete,
+	search.ReasonDeadline,
+	search.ReasonShardUnavailable,
+	search.ReasonDependencyError,
+	search.ReasonInvalidRequest,
 }
 
 var requestSequence atomic.Uint64
@@ -66,6 +79,10 @@ func NewWithBackend(backend search.Backend) *Server {
 
 func newServer(backend search.Backend, broker *ingest.Broker, mode string) *Server {
 	server := &Server{Backend: backend, Broker: broker, Indexer: ingest.NewIndexer(broker, backend), mode: mode, apiKey: os.Getenv("LATTICE_API_KEY")}
+	server.reasons = make(map[string]*atomic.Uint64, len(coverageReasons))
+	for _, reason := range coverageReasons {
+		server.reasons[reason] = new(atomic.Uint64)
+	}
 	if value := os.Getenv("LATTICE_MAX_INFLIGHT_QUERIES"); value != "" {
 		if limit, err := strconv.Atoi(value); err == nil && limit > 0 {
 			server.querySlots = make(chan struct{}, limit)
@@ -179,7 +196,15 @@ func (s *Server) metrics(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintf(w, "# TYPE lattice_query_requests_total counter\nlattice_query_requests_total %d\n", s.queries.Load())
 	fmt.Fprintf(w, "# TYPE lattice_ingest_documents_total counter\nlattice_ingest_documents_total %d\n", s.docs.Load())
 	fmt.Fprintf(w, "# TYPE lattice_index_documents gauge\nlattice_index_documents %d\n", s.Backend.Count())
+	// Incomplete and degraded are deliberately separate series. Incomplete
+	// counts responses that lost shard coverage; degraded counts responses that
+	// carried an error. A response can be in either, both, or neither.
 	fmt.Fprintf(w, "# TYPE lattice_query_incomplete_total counter\nlattice_query_incomplete_total %d\n", s.incomplete.Load())
+	fmt.Fprintf(w, "# TYPE lattice_query_degraded_total counter\nlattice_query_degraded_total %d\n", s.degraded.Load())
+	fmt.Fprintln(w, "# TYPE lattice_query_coverage_reason_total counter")
+	for _, reason := range coverageReasons {
+		fmt.Fprintf(w, "lattice_query_coverage_reason_total{reason=\"%s\"} %d\n", reason, s.reasons[reason].Load())
+	}
 	fmt.Fprintf(w, "# TYPE lattice_query_cache_hits_total counter\nlattice_query_cache_hits_total %d\n", s.cacheHits.Load())
 	fmt.Fprintf(w, "# TYPE lattice_query_cache_misses_total counter\nlattice_query_cache_misses_total %d\n", s.cacheMisses.Load())
 	fmt.Fprintln(w, "# TYPE lattice_query_duration_seconds histogram")
@@ -296,6 +321,7 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 			if json.Unmarshal(payload, &cached) == nil {
 				cached.CacheHit = true
 				s.observeQuery(time.Since(started))
+				s.observeCoverage(cached.Coverage)
 				s.cacheHits.Add(1)
 				writeJSON(w, http.StatusOK, cached)
 				return
@@ -322,14 +348,12 @@ func (s *Server) search(w http.ResponseWriter, r *http.Request) {
 	} else {
 		s.cacheMisses.Add(1)
 	}
-	if s.Cache != nil && response.Coverage.Complete && len(response.Errors) == 0 {
+	if s.Cache != nil && response.Coverage.Usable() {
 		if payload, marshalErr := json.Marshal(response); marshalErr == nil {
 			_ = s.Cache.Set(context.Background(), cacheKey, payload)
 		}
 	}
-	if !response.Coverage.Complete {
-		s.incomplete.Add(1)
-	}
+	s.observeCoverage(response.Coverage)
 	writeJSON(w, http.StatusOK, response)
 }
 
@@ -372,6 +396,18 @@ func (s *Server) observeQuery(elapsed time.Duration) {
 		if seconds <= limit {
 			s.queryBuckets[n].Add(1)
 		}
+	}
+}
+
+func (s *Server) observeCoverage(coverage search.Coverage) {
+	if !coverage.Complete {
+		s.incomplete.Add(1)
+	}
+	if coverage.Degraded {
+		s.degraded.Add(1)
+	}
+	if counter, ok := s.reasons[coverage.Reason]; ok {
+		counter.Add(1)
 	}
 }
 
@@ -761,10 +797,28 @@ components:
         cache_hit: {type: boolean}
         coverage:
           type: object
+          description: >-
+            Completeness and degradation are separate facts. complete answers
+            only "did every queried shard answer?"; degraded answers "did
+            anything fail while answering?". A response can be complete and
+            degraded, or incomplete and not degraded.
+          required: [shards_queried, shards_answered, complete, degraded, reason]
           properties:
-            shards_queried: {type: integer}
-            shards_answered: {type: integer}
-            complete: {type: boolean}
+            shards_queried: {type: integer, description: Shards the query was supposed to reach}
+            shards_answered: {type: integer, description: Shards that returned results}
+            complete: {type: boolean, description: True only when shards_answered equals shards_queried}
+            degraded: {type: boolean, description: True when the response carries at least one error, independent of complete}
+            reason:
+              type: string
+              description: >-
+                Machine-readable classification, so a client never parses error
+                strings. complete: nothing went wrong. deadline: the budget
+                expired before outstanding work returned. shard_unavailable: a
+                shard did not answer and no deadline fired. dependency_error: a
+                dependency such as the embedding service failed; shard coverage
+                may still be complete. invalid_request: rejected before any
+                shard was queried.
+              enum: [complete, deadline, shard_unavailable, dependency_error, invalid_request]
         timings_ms: {type: object}
         errors: {type: array, items: {type: string}}
 `

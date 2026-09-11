@@ -25,24 +25,31 @@ LATTICE had to:
 - rebalance sharded data without silently losing it;
 - ingest and search at least one million documents;
 - return partial search results when part of the cluster is unreachable; and
-- say so explicitly with `"complete": false`.
+- say so explicitly, in a form a program can act on.
 
-Every one of those is implemented and measured. The system never quietly turns a degraded answer into a seemingly complete one — the at-rest million-document benchmark returned 93 explicitly incomplete responses under its deadline, and each one is reported as such rather than hidden.
+The system never quietly turns a degraded answer into a seemingly complete one. Coverage answers **two independent questions** — *did every shard answer?* (`complete`) and *did anything fail?* (`degraded`) — plus a one-word `reason` from a closed set. That separation is what lets a client tell "a shard left rotation" apart from "the embedding service died" without parsing error strings, and it is verified by [`make experiment-partial-opensearch`](docs/experiments/README.md), which stops a real data node and fails if the resulting partial results came with errors attached.
 
 ## Architecture
 
-The architecture has two connected tracks. The first builds the distributed-systems foundations from scratch. The second uses those lessons to operate the LATTICE search product with Kubernetes and OpenSearch.
+The repository contains **two independent tracks**, and it is worth being precise about that before reading the diagram.
+
+- **A from-scratch learning track** (`pkg/`) — WAL, LSM storage, replication without consensus, Raft, and sharding, built from first principles to understand how these systems work.
+- **An operated product track** (`internal/`, `cmd/`) — the search platform, which uses OpenSearch for indexing, sharding, and replication.
+
+**No data flows from the learning track into the query path.** The product imports only `pkg/lsm`, and only for the local development backend; `pkg/raft`, `pkg/shard`, `pkg/replication`, and `pkg/wal` are not on the request path. The foundations exist so that what OpenSearch does is understood rather than magical — not to replace it. Wiring them in would be weeks of work that changes no measurement.
+
+All benchmark numbers in this repository come from the product track, and every table states which backend produced it.
 
 ```mermaid
 flowchart TB
-    subgraph FOUNDATIONS["From-scratch distributed-systems foundations"]
+    subgraph FOUNDATIONS["Learning track: from-scratch foundations (not on the query path)"]
         WAL["WAL<br/>crash recovery"] --> LSM["LSM storage<br/>memtable · SSTable · compaction"]
         LSM --> KV["Replicated KV<br/>without consensus"]
         KV --> RAFT["Raft<br/>leader · log · snapshots"]
         RAFT --> SHARD["Sharded Raft store<br/>consistent hashing · rebalancing"]
     end
 
-    subgraph PRODUCT["LATTICE product on Kubernetes"]
+    subgraph PRODUCT["Product track: LATTICE on Kubernetes (everything measured)"]
         SRC["Sources<br/>Wikipedia · APIs · CDC"] --> KAFKA{{"Kafka<br/>ingest stream"}}
         KAFKA --> IDX["Go indexer<br/>batching · backpressure · DLQ"]
         IDX --> EMB["Embedding service<br/>batched inference"]
@@ -68,10 +75,11 @@ flowchart TB
     OBS -. observes .-> API
     CHAOS["Chaos suite"] -. kills · partitions · overloads .-> OS
     CHAOS -. kills · partitions · overloads .-> API
-    SHARD -. informs implementation and failure tests .-> API
 ```
 
-The custom WAL, LSM, Raft, and sharding packages are deliberately separable and readable on their own. OpenSearch remains the production search index in the final platform; the from-scratch components provide the distributed-systems implementation and reasoning that make the platform understandable rather than magical.
+The two subgraphs do not touch. That is not an omission in the diagram: the learning track and the product track are separate programs that share a repository, and the product's sharding, replication, and consensus are OpenSearch's, not `pkg/`'s.
+
+The custom WAL, LSM, Raft, and sharding packages are deliberately separable and readable on their own. One precision about `pkg/raft`: it is a **deterministic in-process cluster** — the nodes are objects in a single program exchanging messages through a queue under logical time. That is a legitimate and standard way to build and test a consensus algorithm, because it makes the tests repeatable in a way networked tests are not. It is **not** a networked cluster, and its election measurements are in logical ticks rather than milliseconds.
 
 ## End-to-end request flow
 
@@ -109,7 +117,9 @@ Example response shape:
   "coverage": {
     "shards_queried": 6,
     "shards_answered": 5,
-    "complete": false
+    "complete": false,
+    "degraded": false,
+    "reason": "shard_unavailable"
   },
   "timings_ms": {
     "parse": 0.4,
@@ -119,6 +129,8 @@ Example response shape:
   }
 }
 ```
+
+Read that as: a shard is out of rotation, nothing errored, and the results returned are real but partial. Had the deadline expired instead, `degraded` would be `true` and `reason` would be `deadline` — the same `complete: false`, a different event, a different fix. The four `complete`/`degraded` combinations and the full `reason` enum are in [`api.md`](api.md#coverage).
 
 Partial results inside the deadline are preferable to a late complete response, provided the client can see exactly what happened.
 
@@ -182,7 +194,7 @@ Every criterion below is met, and each is stated with the evidence behind it rat
 - [x] **Leader-election time is measured across fifty leader kills** — 50 trials, 3 logical election ticks each ([`docs/election-distribution.csv`](docs/election-distribution.csv)).
 - [x] **One million documents are indexed and searchable with a stated p99** — 1,000,008 documents; 16.66ms p50, 191.85ms p99 at 1,514 QPS.
 - [x] **p99 is measured during an active segment merge, not only at rest** — 24.69ms p50 / 95.55ms p99 during concurrent indexing; 49.06ms p99 during an explicit force-merge (59 → 3 primary segments).
-- [x] **Unreachable shards produce partial results with explicit coverage** — `coverage.complete: false` under deadline pressure, exercised by the chaos suite and the network-partition experiment.
+- [x] **Unreachable shards produce partial results with explicit coverage** — a data node stopped in a three-node OpenSearch cluster produced incomplete responses with `reason: "shard_unavailable"` and zero errors, distinguishable from deadline expiry ([`make experiment-partial-opensearch`](docs/experiments/README.md)). An in-process controlled comparison runs the same three scenarios with injected faults.
 - [x] **Swagger UI and the playground exercise the same API contract used by automated tests** — one OpenAPI spec in [`api/`](api), one contract in [`api.md`](api.md).
 - [x] **Terraform and Argo CD rebuild and deploy the system without manual cluster mutation** — `make smoke-argocd` reconciles the worktree through Argo CD in a disposable kind cluster; a fresh Terraform/operator kind deployment passed publish → Kafka/indexer → hybrid search.
 - [x] **Chaos behavior is documented for every injected failure** — [`chaos/`](chaos/README.md).
@@ -210,10 +222,11 @@ lattice/
 ├─ internal/
 │  ├─ ingest/  ├─ search/  ├─ server/
 │  └─ providers/{opensearch,kafka}/
-├─ pkg/
+├─ pkg/          learning track — not on the query path
 │  ├─ wal/       durable write-ahead log
 │  ├─ lsm/       storage engine
-│  └─ raft/      consensus module
+│  ├─ shard/     consistent hashing
+│  └─ raft/      consensus module (deterministic, in-process)
 ├─ api/           OpenAPI specification
 ├─ deploy/        Compose, Kubernetes, Terraform, and Argo CD
 ├─ bench/         load and recovery tests
@@ -233,7 +246,9 @@ lattice/
 | [`docs/ENGINEERING.md`](docs/ENGINEERING.md) | Search-platform design and operational decisions |
 | [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Incident response and restore procedures |
 | [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) | Assets, trust boundaries, threats, and controls |
+| [`layman.md`](layman.md) | Plain-language explanation, and the answers to the hard questions |
 | [`docs/benchmarks.md`](docs/benchmarks.md) | Measured evidence and remaining capacity, cost, and restore work |
+| [`docs/experiments/README.md`](docs/experiments/README.md) | Designed experiments, their pass conditions, and raw artifacts |
 | [`docs/postmortem-compose-integration.md`](docs/postmortem-compose-integration.md) | Published Compose integration postmortem |
 
 ## Status

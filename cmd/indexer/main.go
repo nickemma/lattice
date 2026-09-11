@@ -94,6 +94,7 @@ func main() {
 		} else {
 			remoteBackend = opensearch.NewBackendWithAliasAndEmbedder(client, indexName, alias, embedder)
 		}
+		applyIndexLayout(remoteBackend)
 		waitContext, cancel := context.WithTimeout(context.Background(), dependencyTimeout())
 		if err := remoteBackend.WaitForIndex(waitContext); err != nil {
 			cancel()
@@ -333,4 +334,36 @@ func dependencyTimeout() time.Duration {
 		return fallback
 	}
 	return duration
+}
+
+// applyIndexLayout lets an operator declare the shard and replica counts used
+// when LATTICE creates its index. The partial-results experiment sets
+// OPENSEARCH_REPLICAS=0 so that stopping a data node genuinely removes a shard
+// from the cluster instead of being routed around.
+func applyIndexLayout(backend *opensearch.Backend) {
+	rawShards := os.Getenv("OPENSEARCH_SHARDS")
+	rawReplicas := os.Getenv("OPENSEARCH_REPLICAS")
+	if rawShards == "" && rawReplicas == "" {
+		return
+	}
+	shards := envPositiveInt("OPENSEARCH_SHARDS", rawShards, 3)
+	replicas := envPositiveInt("OPENSEARCH_REPLICAS", rawReplicas, 1)
+	if shards < 1 {
+		log.Fatalf("OPENSEARCH_SHARDS must be at least 1, got %q", rawShards)
+	}
+	backend.SetIndexLayout(shards, replicas)
+	log.Printf("lattice index layout: shards=%d replicas=%d", shards, replicas)
+}
+
+// envPositiveInt fails loudly rather than falling back on a typo: an index
+// created with the wrong layout is not something a later run can correct.
+func envPositiveInt(name, raw string, fallback int) int {
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 0 {
+		log.Fatalf("%s must be a non-negative integer, got %q", name, raw)
+	}
+	return value
 }

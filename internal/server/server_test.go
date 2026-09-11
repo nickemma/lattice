@@ -258,3 +258,50 @@ func TestRemoteAdminLifecycleIsExposedThroughAPI(t *testing.T) {
 		t.Fatalf("restore response = %d %s", restore.Code, restore.Body.String())
 	}
 }
+
+// TestMetricsSeparateIncompleteFromDegraded checks the split survives the whole
+// HTTP path: a shard drops out, the response is incomplete, and nothing is
+// counted as an error. Before coverage and errors were separated these two
+// series moved together by construction.
+func TestMetricsSeparateIncompleteFromDegraded(t *testing.T) {
+	index := search.NewIndex(3)
+	for _, id := range []string{"one", "two", "three", "four", "five", "six"} {
+		if err := index.Upsert(search.Document{ID: id, Title: "consensus", Body: "consensus"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	handler := New(index).Handler()
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/debug/shards/1", strings.NewReader(`{"available":false}`)))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("shard drill: %d %s", recorder.Code, recorder.Body.String())
+	}
+
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/search?q=consensus&deadline=5s", nil))
+	var response search.Response
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Coverage.Complete || response.Coverage.Reason != search.ReasonShardUnavailable {
+		t.Fatalf("coverage = %+v", response.Coverage)
+	}
+	if response.Coverage.Degraded || len(response.Errors) != 0 {
+		t.Fatalf("unexpected error signal: %+v %v", response.Coverage, response.Errors)
+	}
+
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	metrics := recorder.Body.String()
+	for _, want := range []string{
+		"lattice_query_incomplete_total 1",
+		"lattice_query_degraded_total 0",
+		`lattice_query_coverage_reason_total{reason="shard_unavailable"} 1`,
+		`lattice_query_coverage_reason_total{reason="deadline"} 0`,
+	} {
+		if !strings.Contains(metrics, want) {
+			t.Fatalf("metrics missing %q:\n%s", want, metrics)
+		}
+	}
+}

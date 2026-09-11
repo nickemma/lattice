@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -30,15 +31,11 @@ func main() {
 		dataDir = ".lattice-data"
 	}
 	var api *server.Server
-	var resultCache *redis.Cache
-	if rawURL := os.Getenv("REDIS_URL"); rawURL != "" {
-		var err error
-		resultCache, err = redis.New(rawURL, 30*time.Second)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer resultCache.Close()
+	resultCache, closeCache, err := newResultCache(os.Getenv("REDIS_URL"))
+	if err != nil {
+		log.Fatal(err)
 	}
+	defer closeCache()
 	if remoteURL := os.Getenv("OPENSEARCH_URL"); remoteURL != "" {
 		indexName := os.Getenv("OPENSEARCH_INDEX")
 		if indexName == "" {
@@ -66,6 +63,7 @@ func main() {
 		} else {
 			backend = opensearch.NewBackendWithAliasAndEmbedder(client, indexName, alias, embedder)
 		}
+		applyIndexLayout(backend)
 		waitContext, cancel := context.WithTimeout(context.Background(), dependencyTimeout())
 		if err := backend.WaitForIndex(waitContext); err != nil {
 			cancel()
@@ -130,6 +128,26 @@ func serve(server *http.Server) error {
 	return server.ListenAndServeTLS(certFile, keyFile)
 }
 
+// newResultCache returns the shared query-result cache, or a genuinely nil
+// server.Cache when Redis is not configured.
+//
+// The return type is the interface rather than *redis.Cache on purpose. A nil
+// *redis.Cache stored in a server.Cache interface is not a nil interface: the
+// server's `s.Cache != nil` guards would all pass, and /readyz and every query
+// would dereference it. That crashed the readiness probe of any deployment that
+// configured OpenSearch without Redis.
+func newResultCache(rawURL string) (server.Cache, func() error, error) {
+	noop := func() error { return nil }
+	if rawURL == "" {
+		return nil, noop, nil
+	}
+	cache, err := redis.New(rawURL, 30*time.Second)
+	if err != nil {
+		return nil, noop, err
+	}
+	return cache, cache.Close, nil
+}
+
 func envOr(key, fallback string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
@@ -149,4 +167,36 @@ func dependencyTimeout() time.Duration {
 		return fallback
 	}
 	return duration
+}
+
+// applyIndexLayout lets an operator declare the shard and replica counts used
+// when LATTICE creates its index. The partial-results experiment sets
+// OPENSEARCH_REPLICAS=0 so that stopping a data node genuinely removes a shard
+// from the cluster instead of being routed around.
+func applyIndexLayout(backend *opensearch.Backend) {
+	rawShards := os.Getenv("OPENSEARCH_SHARDS")
+	rawReplicas := os.Getenv("OPENSEARCH_REPLICAS")
+	if rawShards == "" && rawReplicas == "" {
+		return
+	}
+	shards := envPositiveInt("OPENSEARCH_SHARDS", rawShards, 3)
+	replicas := envPositiveInt("OPENSEARCH_REPLICAS", rawReplicas, 1)
+	if shards < 1 {
+		log.Fatalf("OPENSEARCH_SHARDS must be at least 1, got %q", rawShards)
+	}
+	backend.SetIndexLayout(shards, replicas)
+	log.Printf("lattice index layout: shards=%d replicas=%d", shards, replicas)
+}
+
+// envPositiveInt fails loudly rather than falling back on a typo: an index
+// created with the wrong layout is not something a later run can correct.
+func envPositiveInt(name, raw string, fallback int) int {
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 0 {
+		log.Fatalf("%s must be a non-negative integer, got %q", name, raw)
+	}
+	return value
 }

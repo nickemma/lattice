@@ -20,10 +20,35 @@ type Backend struct {
 	Index     string
 	Alias     string
 	Embedder  embedding.Embedder
+	layout    *indexLayout
 	count     atomic.Int64
 	indexMu   sync.RWMutex
 	writeMu   sync.RWMutex
 	dualWrite string
+}
+
+type indexLayout struct{ shards, replicas int }
+
+// Index layout used when SetIndexLayout has not been called.
+const (
+	defaultShards   = 3
+	defaultReplicas = 1
+)
+
+// SetIndexLayout overrides the shard and replica counts this backend uses when
+// it creates an index. Zero replicas is a meaningful value, not "unset": the
+// partial-results experiment needs a replica-free index, because with a replica
+// available OpenSearch routes around a stopped data node and coverage correctly
+// stays complete — which is the wrong experiment. Existing indexes are never
+// re-laid-out; this only affects creation.
+func (b *Backend) SetIndexLayout(shards, replicas int) {
+	if shards < 1 {
+		shards = defaultShards
+	}
+	if replicas < 0 {
+		replicas = 0
+	}
+	b.layout = &indexLayout{shards: shards, replicas: replicas}
 }
 
 type branchResult struct {
@@ -204,7 +229,11 @@ func (b *Backend) EnsureIndex(ctx context.Context) error {
 }
 
 func (b *Backend) ensureIndex(ctx context.Context, index string) error {
-	body := []byte(`{"settings":{"index":{"knn":true,"number_of_shards":3,"number_of_replicas":1}},"mappings":{"properties":{"id":{"type":"keyword"},"title":{"type":"text"},"body":{"type":"text"},"tags":{"type":"keyword"},"embedding":{"type":"knn_vector","dimension":64}}}}`)
+	shards, replicas := defaultShards, defaultReplicas
+	if b.layout != nil {
+		shards, replicas = b.layout.shards, b.layout.replicas
+	}
+	body := fmt.Appendf(nil, `{"settings":{"index":{"knn":true,"number_of_shards":%d,"number_of_replicas":%d}},"mappings":{"properties":{"id":{"type":"keyword"},"title":{"type":"text"},"body":{"type":"text"},"tags":{"type":"keyword"},"embedding":{"type":"knn_vector","dimension":64}}}}`, shards, replicas)
 	_, err := b.Client.do(ctx, "PUT", "/"+index, body)
 	if err != nil && !strings.Contains(err.Error(), "resource_already_exists_exception") {
 		return err
@@ -351,10 +380,10 @@ func (b *Backend) SearchWithFilters(ctx context.Context, query string, tags []st
 func (b *Backend) SearchWithFiltersCursor(ctx context.Context, query string, tags []string, token string, size int) search.Response {
 	cursor, err := search.DecodeCursor(token)
 	if err != nil {
-		return search.Response{Errors: []string{err.Error()}}
+		return search.Response{Coverage: search.RejectedCoverage(), Errors: []string{err.Error()}}
 	}
 	if cursor.Query != query || cursor.Size != size || !sameTags(cursor.Tags, tags) {
-		return search.Response{Errors: []string{"cursor does not match query, filters, or page size"}}
+		return search.Response{Coverage: search.RejectedCoverage(), Errors: []string{"cursor does not match query, filters, or page size"}}
 	}
 	return b.searchWithFilters(ctx, query, tags, cursor.Offset, size, true)
 }
@@ -405,19 +434,33 @@ func (b *Backend) searchWithFilters(ctx context.Context, query string, tags []st
 		go func() { channels <- b.searchBranch(ctx, "vector", vectorBody) }()
 	}
 	var bm25, vector []search.Result
-	coverage := search.Coverage{ShardsQueried: 0}
+	// Coverage is collected as raw observations and classified in one place by
+	// search.EvaluateCoverage. A branch that errored carries no shard
+	// accounting, so it reports a dependency failure and contributes nothing to
+	// the shard numbers.
+	//
+	// Answered is the minimum successful count across the branches that did
+	// report, not the maximum. If the keyword branch saw 3/3 while the vector
+	// branch saw 2/3 because a data node is down, the response really is
+	// missing a shard's worth of vector candidates, and taking the maximum
+	// would hide exactly the event this field exists to expose.
+	signals := search.CoverageSignals{DependencyFailed: embedErr != nil}
+	answered := -1
+gather:
 	for n := 0; n < branchCount; n++ {
 		select {
 		case result := <-channels:
-			if result.shards.Total > coverage.ShardsQueried {
-				coverage.ShardsQueried = result.shards.Total
-			}
-			if result.shards.Successful > coverage.ShardsAnswered {
-				coverage.ShardsAnswered = result.shards.Successful
-			}
 			if result.err != nil {
+				signals.DependencyFailed = true
 				response.Errors = append(response.Errors, result.name+": "+result.err.Error())
 				continue
+			}
+			signals.ShardsObserved = true
+			if result.shards.Total > signals.ShardsQueried {
+				signals.ShardsQueried = result.shards.Total
+			}
+			if answered < 0 || result.shards.Successful < answered {
+				answered = result.shards.Successful
 			}
 			if result.name == "bm25" {
 				bm25 = result.results
@@ -427,15 +470,18 @@ func (b *Backend) searchWithFilters(ctx context.Context, query string, tags []st
 				response.Timings.Vector = float64(result.elapsed.Microseconds()) / 1000
 			}
 		case <-ctx.Done():
+			signals.DeadlineExceeded = true
 			response.Errors = append(response.Errors, "deadline exceeded while querying OpenSearch")
-			n = 2
+			break gather
 		}
 	}
-	if coverage.ShardsQueried == 0 {
-		coverage.ShardsQueried = 1
+	if answered > 0 {
+		signals.ShardsAnswered = answered
 	}
-	coverage.Complete = coverage.ShardsAnswered == coverage.ShardsQueried && len(response.Errors) == 0
-	response.Coverage = coverage
+	if signals.ShardsQueried == 0 {
+		signals.ShardsQueried = 1
+	}
+	response.Coverage = search.EvaluateCoverage(signals)
 	response.Timings.Parse = float64(time.Since(started).Microseconds()) / 1000
 	response.Results = search.FuseResults(bm25, vector)
 	totalResults := len(response.Results)
@@ -447,7 +493,7 @@ func (b *Backend) searchWithFilters(ctx context.Context, query string, tags []st
 			end = totalResults
 		}
 		response.Results = response.Results[from:end]
-		if cursorEnabled && end < totalResults && response.Coverage.Complete && len(response.Errors) == 0 {
+		if cursorEnabled && end < totalResults && response.Coverage.Usable() {
 			response.NextCursor = search.EncodeCursor(search.Cursor{Query: query, Tags: append([]string(nil), tags...), Size: size, Offset: end})
 		}
 	}

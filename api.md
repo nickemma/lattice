@@ -15,7 +15,8 @@ open http://localhost:8080/playground
 
 The shortest API check is: publish a document, search for a word from its
 title, then repeat the search with a paraphrase. The expected publish status
-is `202`; the expected search status is `200` with `coverage.complete: true`.
+is `202`; the expected search status is `200` with `coverage.complete: true`
+and `coverage.reason: "complete"`.
 The complete, copy/paste version of this flow—including Compose, Kafka replay,
 partial results, snapshots, restore, and Kubernetes—is in
 [`docs/walkthrough.md`](docs/walkthrough.md).
@@ -99,11 +100,24 @@ adapter is active.
 ### `GET /metrics`
 
 Returns Prometheus text format. The important query series are
-`lattice_query_requests_total`, `lattice_query_incomplete_total`,
-`lattice_query_duration_seconds` (histogram),
+`lattice_query_requests_total`, `lattice_query_duration_seconds` (histogram),
 `lattice_query_cache_hits_total`, `lattice_query_cache_misses_total`, and
 `lattice_index_documents`. Ingest totals include
 `lattice_ingest_documents_total` and `lattice_ingest_dlq_total`.
+
+Three series describe query health, and they are deliberately independent:
+
+| Series | Counts |
+|---|---|
+| `lattice_query_incomplete_total` | Responses that lost shard coverage |
+| `lattice_query_degraded_total` | Responses that carried at least one error |
+| `lattice_query_coverage_reason_total{reason="…"}` | Responses by coverage reason |
+
+A response can be in either counter, both, or neither. Alert on them
+separately: rising `incomplete` with flat `degraded` is a shard leaving
+rotation, while rising `degraded` with flat `incomplete` is a dependency
+failing behind an otherwise healthy cluster. Every `reason` label is exported
+even at zero, so a missing label means an old build rather than a quiet system.
 
 The separate Compose indexer exposes partition lag at
 `http://localhost:19091/metrics`, including
@@ -194,24 +208,66 @@ Response shape:
     "score":0.0164,
     "source":"hybrid"
   }],
-  "coverage":{"shards_queried":3,"shards_answered":3,"complete":true},
+  "coverage":{"shards_queried":3,"shards_answered":3,"complete":true,"degraded":false,"reason":"complete"},
   "timings_ms":{"parse":0.04,"bm25":0.31,"vector":0.22,"fuse":0.05}
 }
 ```
 
 `source` identifies the contributing branch (`bm25`, `vector`, or `hybrid`).
-`timings_ms` contains parse, BM25, vector, and fusion phase timings.
-`errors` describes a deadline or branch failure. `cache_hit` is present when a
-complete response came from the bounded cache.
+`timings_ms` contains parse, BM25, vector, and fusion phase timings, so a tail
+can be attributed to the keyword branch or the kNN branch rather than to the
+query as a whole. `errors` carries human-readable detail. `cache_hit` is
+present when a response came from the bounded cache.
 
-Coverage is the correctness contract:
+### Coverage
 
-- `complete: true` means every queried shard answered within the budget.
-- `complete: false` means at least one shard did not answer; returned results
-  remain usable but are partial.
-- `shards_answered` can be lower than `shards_queried` because of a failed
-  shard or deadline.
-- Incomplete responses do not advertise a continuation cursor.
+Coverage is the correctness contract, and it answers **two independent
+questions**. Reading either one alone will mislead you.
+
+| Field | Answers only |
+|---|---|
+| `complete` | Did every queried shard answer? |
+| `degraded` | Did anything fail while answering? |
+
+All four combinations are real and all four are reachable:
+
+| `complete` | `degraded` | What happened |
+|---|---|---|
+| `true` | `false` | Normal. Every shard answered, nothing failed. |
+| `false` | `false` | A shard is out of rotation. Nothing errored; results are partial. |
+| `true` | `true` | Every shard answered, but a dependency failed — for example the embedding service died, so only the keyword branch contributed. |
+| `false` | `true` | The deadline expired with work outstanding. |
+
+`reason` is the machine-readable classification. **Switch on it; never parse
+the `errors` strings.** It is a closed set:
+
+| `reason` | Meaning | Operational response |
+|---|---|---|
+| `complete` | Nothing went wrong. | None. |
+| `deadline` | The budget expired before outstanding work returned. Coverage may still be complete if what was lost was a whole branch rather than a shard. | Raise the deadline, or find what got slow. |
+| `shard_unavailable` | A shard did not answer and no deadline fired. The shard is out of rotation, not merely slow. | Check cluster health and shard allocation. |
+| `dependency_error` | A dependency the query needs failed. Shard coverage may still be complete. | Check the embedding service and the index client. |
+| `invalid_request` | Rejected before any shard was queried. Normally surfaced as `400` instead. | Fix the caller. |
+
+Further guarantees:
+
+- `shards_answered` below `shards_queried` always means real coverage loss.
+  With OpenSearch it is the **minimum** successful shard count across the
+  keyword and vector branches, not the maximum: if the keyword branch saw 3 of
+  3 shards while the vector branch saw 2 of 3, the response really is missing a
+  shard's worth of vector candidates, and reporting 3 would hide exactly the
+  event this field exists to expose.
+- A response that is incomplete **or** degraded is never cached and never
+  advertises a continuation cursor. Only `complete && !degraded` is
+  continuable.
+- Partial results are still `200`. The status code describes the request, not
+  the completeness of the answer; `coverage` describes the answer.
+
+```bash
+# Route on the classification, not on the prose.
+curl -fsS -G http://localhost:8080/v1/search \
+  --data-urlencode 'q=consensus' | jq -r '.coverage.reason'
+```
 
 `400` covers a missing/invalid query, deadline, paging value, malformed
 cursor, cursor mismatch, or deep offset without a cursor. `429` means the
@@ -246,16 +302,41 @@ against OpenSearch. It toggles availability and/or injects a bounded delay.
 
 `delay_ms` must be `0..30000`; invalid JSON or shard IDs return `400`.
 
+**This is an experiment control, not a production API.** It injects a fault
+in-process. A number produced with it is an *injected* fault on the *in-memory*
+backend, and must be reported as such — it is not an observed node failure, and
+OpenSearch has no equivalent knob, so results from the two backends are not
+interchangeable. To induce a real shard loss in a real cluster, stop a data node
+(see [`scripts/partial-results-opensearch.sh`](scripts/partial-results-opensearch.sh)).
+
+The two failure classes look different in the response, which is the point:
+
 ```bash
-curl -fsS -X POST http://localhost:8080/v1/debug/shards/0 \
+# 1. A shard leaves rotation. Nothing errors.
+curl -fsS -X POST http://localhost:8080/v1/debug/shards/1 \
   -H 'content-type: application/json' -d '{"available":false}'
 curl -fsS -G http://localhost:8080/v1/search \
-  --data-urlencode 'q=distributed consensus' --data-urlencode 'deadline=150ms'
-curl -fsS -X POST http://localhost:8080/v1/debug/shards/0 \
-  -H 'content-type: application/json' -d '{"available":true}'
+  --data-urlencode 'q=distributed consensus' --data-urlencode 'deadline=150ms' \
+  | jq '{complete: .coverage.complete, degraded: .coverage.degraded,
+         reason: .coverage.reason, errors: .errors}'
+# → {"complete": false, "degraded": false, "reason": "shard_unavailable", "errors": null}
+
+# 2. A shard stalls past the deadline. This one does error.
+curl -fsS -X POST http://localhost:8080/v1/debug/shards/1 \
+  -H 'content-type: application/json' -d '{"available":true,"delay_ms":5000}'
+curl -fsS -G http://localhost:8080/v1/search \
+  --data-urlencode 'q=distributed consensus' --data-urlencode 'deadline=150ms' \
+  | jq '{complete: .coverage.complete, degraded: .coverage.degraded,
+         reason: .coverage.reason}'
+# → {"complete": false, "degraded": true, "reason": "deadline"}
+
+# 3. Put it back.
+curl -fsS -X POST http://localhost:8080/v1/debug/shards/1 \
+  -H 'content-type: application/json' -d '{"available":true,"delay_ms":0}'
 ```
 
-The middle response should show fewer answered shards and `complete:false`.
+Both middle responses show `complete: false` with fewer answered shards. They
+are different events, and `reason` is what tells them apart.
 
 ## Administrative operations
 
@@ -314,6 +395,24 @@ security boundary. Import `/openapi.yaml` into client generators or Postman.
 
 For environment setup and the complete publish → stream → index → search →
 failure → restore exercise, see [`docs/walkthrough.md`](docs/walkthrough.md).
+
+## Index layout
+
+When LATTICE creates its OpenSearch index it uses 3 primary shards and 1
+replica. Both are overridable, and they only apply at index creation — an
+existing index is never re-laid-out.
+
+| Variable | Default | Notes |
+|---|---:|---|
+| `OPENSEARCH_SHARDS` | `3` | Must be at least 1 |
+| `OPENSEARCH_REPLICAS` | `1` | `0` is meaningful, not "unset" |
+
+`OPENSEARCH_REPLICAS=0` exists for the partial-results experiment. With a
+replica available, stopping a data node is routed around and coverage correctly
+stays complete, so there is no way to observe an unavailable shard. Zero
+replicas means one stopped node genuinely removes a shard from the cluster.
+**Do not run zero replicas in production**; it trades durability and
+availability for an observable failure mode.
 
 ## Configuration boundary
 

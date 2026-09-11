@@ -129,9 +129,27 @@ components:
         cache_hit: {type: boolean}
         coverage:
           type: object
+          description: >-
+            Completeness and degradation are separate facts. complete answers
+            only "did every queried shard answer?"; degraded answers "did
+            anything fail while answering?". A response can be complete and
+            degraded, or incomplete and not degraded.
+          required: [shards_queried, shards_answered, complete, degraded, reason]
           properties:
-            shards_queried: {type: integer}
-            shards_answered: {type: integer}
-            complete: {type: boolean}
+            shards_queried: {type: integer, description: Shards the query was supposed to reach}
+            shards_answered: {type: integer, description: Shards that returned results}
+            complete: {type: boolean, description: True only when shards_answered equals shards_queried}
+            degraded: {type: boolean, description: True when the response carries at least one error, independent of complete}
+            reason:
+              type: string
+              description: >-
+                Machine-readable classification, so a client never parses error
+                strings. complete: nothing went wrong. deadline: the budget
+                expired before outstanding work returned. shard_unavailable: a
+                shard did not answer and no deadline fired. dependency_error: a
+                dependency such as the embedding service failed; shard coverage
+                may still be complete. invalid_request: rejected before any
+                shard was queried.
+              enum: [complete, deadline, shard_unavailable, dependency_error, invalid_request]
         timings_ms: {type: object}
         errors: {type: array, items: {type: string}}
