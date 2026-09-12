@@ -18,6 +18,16 @@ name: lattice-multinode
 #   bash scripts/partial-results-opensearch.sh
 #   docker compose -f deploy/docker-compose.multinode.yaml down -v
 
+# Resource caps are mandatory here, not tuning. This overlay is normally run on
+# a development laptop alongside an editor, and three unconstrained OpenSearch
+# nodes will take the machine with them: a JVM's footprint is roughly double its
+# heap once metaspace, thread stacks, and Lucene's off-heap buffers are counted,
+# so three nodes at -Xmx512m measured 3.2 GiB resident and pushed an 8 GiB host
+# into swap. Swap is what turns a slow editor into an unresponsive one.
+#
+# 256m heap is ample for the corpus this experiment uses (tens of thousands of
+# small documents). The caps below hold the whole cluster near 2 GiB and 4 cores,
+# leaving the rest of the machine usable.
 x-opensearch-node: &opensearch-node
   image: opensearchproject/opensearch:2.17.1
   environment: &opensearch-env
@@ -27,7 +37,15 @@ x-opensearch-node: &opensearch-node
     bootstrap.memory_lock: "true"
     DISABLE_INSTALL_DEMO_CONFIG: "true"
     DISABLE_SECURITY_PLUGIN: "true"
-    OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+    OPENSEARCH_JAVA_OPTS: "-Xms256m -Xmx256m"
+  # mem_limit and cpus are the non-swarm Compose keys; deploy.resources is
+  # ignored outside swarm and would silently cap nothing.
+  mem_limit: 768m
+  # 1.5 rather than 1.0: the experiment needs the baseline to stay inside the
+  # 200ms deadline, because a saturated baseline is excluded from scoring and a
+  # run where everything saturates demonstrates nothing. This still leaves about
+  # ten of sixteen cores for the rest of the machine.
+  cpus: 1.5
   ulimits:
     memlock: {soft: -1, hard: -1}
     nofile: {soft: 65536, hard: 65536}
@@ -67,6 +85,8 @@ services:
   lattice-query:
     build:
       context: ..
+    mem_limit: 256m
+    cpus: 1.0
     environment:
       LATTICE_ADDR: ":8080"
       OPENSEARCH_URL: http://opensearch-1:9200

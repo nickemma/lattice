@@ -31,13 +31,16 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+# shellcheck source=scripts/experiment-guardrails.sh
+source scripts/experiment-guardrails.sh
+
 OUT_DIR="${1:-docs/experiments}"
 BASE="${LATTICE_EXPERIMENT_URL:-http://127.0.0.1:8080}"
 OS_URL="${LATTICE_EXPERIMENT_OPENSEARCH_URL:-http://127.0.0.1:19200}"
 INDEX="${LATTICE_EXPERIMENT_INDEX:-lattice-documents}"
 QUERIES="${LATTICE_EXPERIMENT_QUERIES:-2000}"
 RUNS="${LATTICE_EXPERIMENT_RUNS:-5}"
-CONCURRENCY="${LATTICE_EXPERIMENT_CONCURRENCY:-32}"
+CONCURRENCY="${LATTICE_EXPERIMENT_CONCURRENCY:-${LATTICE_DEFAULT_CONCURRENCY}}"
 DEADLINE="${LATTICE_EXPERIMENT_DEADLINE:-200ms}"
 WARMUP="${LATTICE_EXPERIMENT_WARMUP:-10s}"
 # Descending merge targets. Each is a point on the curve; four or more points
@@ -49,6 +52,9 @@ WORK="$(mktemp -d)"
 COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 mkdir -p "${OUT_DIR}"
 trap 'rm -rf "${WORK}"' EXIT
+
+announce_profile
+require_memory 768 "the load generator beside the running stack"
 
 if ! curl -fsS "${BASE}/healthz" >/dev/null 2>&1; then
   echo "LATTICE is not answering at ${BASE}." >&2
@@ -99,7 +105,7 @@ for target in ${TARGETS}; do
   echo "    segments now: ${actual} (merge took ${merge_seconds}s)"
 
   output="${OUT_DIR}/segment-latency-${label}.json"
-  "${WORK}/latticebench" \
+  "${LATTICE_NICE[@]}" "${WORK}/latticebench" \
     -url "${BASE}" \
     -q "common=raft" \
     -q "rare=sstables" \

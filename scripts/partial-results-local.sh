@@ -26,13 +26,27 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+# shellcheck source=scripts/experiment-guardrails.sh
+source scripts/experiment-guardrails.sh
+
 OUT_DIR="${1:-docs/experiments}"
 PORT="${LATTICE_EXPERIMENT_PORT:-18080}"
 BASE="http://127.0.0.1:${PORT}"
-DOCS="${LATTICE_EXPERIMENT_DOCS:-20000}"
-QUERIES="${LATTICE_EXPERIMENT_QUERIES:-2000}"
+# The in-process vector branch scores every document in a shard on every query,
+# so corpus size drives per-query cost directly and a large corpus pushes the
+# multi-term query past the deadline in the *baseline* — which makes that
+# configuration saturated and useless for attributing incompleteness to a fault.
+# This experiment measures the coverage classification, not capacity, so the
+# corpus is deliberately small enough that all three query classes fit inside
+# the budget when nothing is wrong.
+DOCS="${LATTICE_EXPERIMENT_DOCS:-5000}"
+# In the deadline scenario every query waits out the full budget, so runtime is
+# queries x runs / concurrency x deadline and nothing else. 1000 keeps the whole
+# three-scenario experiment near ten minutes while leaving p99 based on the ten
+# worst samples per run, with five runs behind every reported median.
+QUERIES="${LATTICE_EXPERIMENT_QUERIES:-1000}"
 RUNS="${LATTICE_EXPERIMENT_RUNS:-5}"
-CONCURRENCY="${LATTICE_EXPERIMENT_CONCURRENCY:-8,32,128}"
+CONCURRENCY="${LATTICE_EXPERIMENT_CONCURRENCY:-${LATTICE_DEFAULT_CONCURRENCY}}"
 DEADLINE="${LATTICE_EXPERIMENT_DEADLINE:-200ms}"
 STALL_MS="${LATTICE_EXPERIMENT_STALL_MS:-5000}"
 WARMUP="${LATTICE_EXPERIMENT_WARMUP:-3s}"
@@ -52,13 +66,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+announce_profile
+# The API holds the corpus in memory and the load generator buffers responses.
+require_memory 1024 "the in-process backend and load generator"
+
 echo "==> building"
 go build -o "${WORK}/lattice" ./cmd
 go build -o "${WORK}/latticectl" ./cmd/latticectl
 go build -o "${WORK}/latticebench" ./cmd/latticebench
 
 echo "==> starting API on ${BASE} (in-process backend, 3 shards)"
-LATTICE_ADDR=":${PORT}" LATTICE_DATA_DIR="${DATA_DIR}" "${WORK}/lattice" >"${WORK}/lattice.log" 2>&1 &
+LATTICE_ADDR=":${PORT}" LATTICE_DATA_DIR="${DATA_DIR}" \
+  "${LATTICE_NICE[@]}" "${WORK}/lattice" >"${WORK}/lattice.log" 2>&1 &
 API_PID=$!
 for _ in $(seq 1 60); do
   if curl -fsS "${BASE}/healthz" >/dev/null 2>&1; then break; fi
@@ -75,7 +94,7 @@ shard_state() { # shard, json body
 }
 
 run_bench() { # scenario, fault-source, note, output
-  "${WORK}/latticebench" \
+  "${LATTICE_NICE[@]}" "${WORK}/latticebench" \
     -url "${BASE}" \
     -q "common=raft" \
     -q "rare=sstables" \

@@ -269,6 +269,60 @@ curl -fsS -G http://localhost:8080/v1/search \
   --data-urlencode 'q=consensus' | jq -r '.coverage.reason'
 ```
 
+#### This contract is measured, not asserted
+
+Two experiments drive 5,000 searches per configuration and fail loudly if the
+contract does not hold. Both were run at commit `c0a724f`.
+
+**On a real cluster** (`make experiment-partial-opensearch`): OpenSearch 2.17.1,
+three data nodes, three shards, no replicas. A data node was stopped, the cluster
+went red, the API kept serving, and the search API reported `_shards total=3
+successful=2`:
+
+| `phrase`, concurrency 4 | Baseline | Node stopped | Recovered |
+|---|---:|---:|---:|
+| Incomplete | 0 | **5,000** | 0 |
+| Degraded | 0 | **0** | 0 |
+| With `errors` | 0 | **0** | 0 |
+| `reason` | `complete` | `shard_unavailable` | `complete` |
+
+**In-process** (`make experiment-partial-local`), the controlled comparison:
+
+| | Baseline | Shard removed |
+|---|---:|---:|
+| Completed | 5,000 | 5,000 |
+| `complete: false` | 0 | 5,000 |
+| `degraded: true` | 0 | 0 |
+| Responses with `errors` | 0 | 0 |
+| `reason` | `complete` × 5,000 | `shard_unavailable` × 5,000 |
+
+Five of nine configurations isolated the availability path exactly like that
+in-process, and one did on the real cluster. Where a configuration ran hot enough
+that the deadline also expired, the invariant the split exists to guarantee held
+to the response:
+
+```
+api_error_responses == coverage_reasons["deadline"]
+```
+
+In-process: 1203 = 1203, 16 = 16, 1370 = 1370, 768 = 768. On OpenSearch: 7 = 7,
+10 = 10, 2 = 2. **Every error was a deadline expiry; none was an availability
+loss.** The experiments fail loudly if that equality breaks, which is what would
+happen if completeness were ever recoupled to the error list.
+
+Note the caching consequence below is in-process behaviour. The OpenSearch
+overlay runs without Redis, where losing a shard means scanning less data and
+degraded mode is actually *cheaper* — the effect reverses between backends,
+which is why no latency figure here is quoted without naming the backend that
+produced it.
+
+One consequence worth planning for as a client: an incomplete or degraded
+response is never cached, so a degraded response is also an uncached one. In the
+run above the baseline served 5,000 of 5,000 from cache and the fault run served
+none, which moved p99 from 2 ms to 87 ms. Most of that gap is the cold cache
+rather than the missing shard — compare degraded states against each other, not
+against a cache-warm baseline.
+
 `400` covers a missing/invalid query, deadline, paging value, malformed
 cursor, cursor mismatch, or deep offset without a cursor. `429` means the
 configured `LATTICE_MAX_INFLIGHT_QUERIES` limit is exhausted. A usable partial

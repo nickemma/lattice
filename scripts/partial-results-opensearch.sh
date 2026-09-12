@@ -28,15 +28,18 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+# shellcheck source=scripts/experiment-guardrails.sh
+source scripts/experiment-guardrails.sh
+
 OUT_DIR="${1:-docs/experiments}"
 COMPOSE_FILE="deploy/docker-compose.multinode.yaml"
 BASE="${LATTICE_EXPERIMENT_URL:-http://127.0.0.1:18080}"
 OS_URL="${LATTICE_EXPERIMENT_OPENSEARCH_URL:-http://127.0.0.1:19200}"
 INDEX="${LATTICE_EXPERIMENT_INDEX:-lattice-documents}"
-DOCS="${LATTICE_EXPERIMENT_DOCS:-50000}"
-QUERIES="${LATTICE_EXPERIMENT_QUERIES:-2000}"
+DOCS="${LATTICE_EXPERIMENT_DOCS:-20000}"
+QUERIES="${LATTICE_EXPERIMENT_QUERIES:-1000}"
 RUNS="${LATTICE_EXPERIMENT_RUNS:-5}"
-CONCURRENCY="${LATTICE_EXPERIMENT_CONCURRENCY:-8,32,128}"
+CONCURRENCY="${LATTICE_EXPERIMENT_CONCURRENCY:-${LATTICE_DEFAULT_CONCURRENCY}}"
 DEADLINE="${LATTICE_EXPERIMENT_DEADLINE:-200ms}"
 WARMUP="${LATTICE_EXPERIMENT_WARMUP:-10s}"
 # The node to stop. It must not be the elected cluster manager's only quorum
@@ -65,6 +68,11 @@ require_up() {
   fi
 }
 
+announce_profile
+# The cluster is already running and capped by the Compose overlay; this is the
+# headroom the load generator and the seeding client need beside it.
+require_memory 768 "the load generator beside the running cluster"
+
 echo "==> checking the cluster"
 require_up
 curl -fsS "${OS_URL}/_cluster/health?wait_for_status=green&timeout=120s" >/dev/null
@@ -83,12 +91,12 @@ go build -o "${WORK}/latticectl" ./cmd/latticectl
 go build -o "${WORK}/latticebench" ./cmd/latticebench
 
 echo "==> seeding ${DOCS} documents"
-LATTICE_URL="${BASE}" "${WORK}/latticectl" seed -count "${DOCS}" -concurrency 32 >/dev/null
+LATTICE_URL="${BASE}" "${LATTICE_NICE[@]}" "${WORK}/latticectl" seed -count "${DOCS}" -concurrency 32 >/dev/null
 curl -fsS -X POST "${OS_URL}/${INDEX}/_refresh" >/dev/null
 curl -fsS "${OS_URL}/_cluster/health?wait_for_status=green&timeout=120s" >/dev/null
 
 run_bench() { # scenario, fault-source, note, output
-  "${WORK}/latticebench" \
+  "${LATTICE_NICE[@]}" "${WORK}/latticebench" \
     -url "${BASE}" \
     -q "common=raft" \
     -q "rare=sstables" \

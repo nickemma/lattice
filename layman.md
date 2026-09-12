@@ -276,15 +276,78 @@ Three rules govern every number in this project:
 **Corpus and latency.** Over 1,000,008 documents: p50 around 17ms, p99 around
 191ms at rest, under a 200ms deadline.
 
-**Partial results actually work.** With a data node genuinely stopped in a
-three-node cluster, searches kept returning results, marked incomplete, with
-`reason: "shard_unavailable"` and **zero errors**. That last part is the
-evidence: it proves the availability path is distinguishable from the deadline
-path, which is precisely what the earlier runs could not show.
+**Partial results actually work — on a real cluster.** This is the measurement
+the earlier runs could not produce. A data node was genuinely stopped in a
+three-node OpenSearch cluster. The cluster went red, a third of the data became
+unreachable, and the search service kept answering. Across 5,000 searches:
 
-**The two failure classes look different.** Losing a shard and blowing the
-deadline produce different latency distributions. Deadline-driven incompleteness
-pins latency at the deadline; availability-driven incompleteness does not.
+| | Baseline | Node stopped | Node back |
+|---|---:|---:|---:|
+| Searches completed | 5,000 | 5,000 | 5,000 |
+| Marked incomplete | 0 | **5,000** | 0 |
+| Carrying an error | 0 | **0** | 0 |
+| Reason reported | `complete` | `shard_unavailable` | `complete` |
+
+Every search still came back. Every one said it was incomplete. **Not one
+reported an error** — because nothing had errored; a shard was simply out of
+reach. The node was restarted, the cluster went green, and the numbers returned
+to where they started. That is the claim, and it is now a number rather than a
+sentence.
+
+The same experiment runs in-process too, with the fault injected rather than
+induced, as a controlled comparison. Both are scored by the same checker.
+
+Some configurations were *compound*: under heavier load the fault also pushed
+queries past the deadline. In every one of those, the error count matched the
+deadline count **exactly** — 7 and 7, 10 and 10, 2 and 2 on the cluster; 1203 and
+1203, 16 and 16, 1370 and 1370, 768 and 768 in-process. Every error was accounted
+for by a deadline. **None was an availability loss.** That equality is the whole
+point of splitting the two signals: if they were still welded together it would
+break immediately.
+
+Be precise about the strength of this if someone asks: on the real cluster
+**one** configuration isolated the availability path perfectly, plus three
+compound ones that held the invariant. Five more were thrown out because the
+cluster was already missing its deadline under load alone, before any fault — and
+a configuration that is broken to begin with cannot tell you what the fault did.
+That is a small clean result, not a broad sweep, and the reason is that the
+cluster was CPU-limited to keep a laptop usable while measuring.
+
+**The two failure classes look different — measurably.** This is the part worth
+showing someone who doubts the labels:
+
+| Load | Shard removed | Deadline stalled |
+|---|---:|---:|
+| light | 56ms | 207ms |
+| medium | 128ms | 207ms |
+| heavy | 227ms | 219ms |
+
+Losing a shard gets **worse as the system gets busier** — the remaining shards
+absorb the work. Blowing the deadline stays **flat**, because the answer leaves
+when the clock says so no matter what is happening behind it.
+
+That means the classification can be checked independently: the shape of the
+data has to match the label on it. You are not asked to take the `reason` field
+on trust.
+
+**And one honest complication, which is itself a finding.** The same fault costs
+the opposite thing on the two backends:
+
+| Losing one shard | In-process | Real cluster |
+|---|---:|---:|
+| Before | 2 ms | 195 ms |
+| After | 87 ms | 103 ms |
+| Effect | **43x slower** | **1.9x faster** |
+
+Both are right. On the real cluster a missing shard means a third less data to
+search, so it is genuinely *quicker*. In-process, an incomplete response can
+never be cached, so losing the shard also lost a 100% cache hit rate — and that
+swamped the saving.
+
+**The effect does not just differ in size, it flips direction.** This is why
+every table in the project names its backend. Quoting one of these numbers as
+though it described the other would be simply false, and nothing but the labelling
+prevents it.
 
 ### The finding nobody was looking for
 
@@ -345,10 +408,18 @@ reason.
 
 ### "How do I know your partial results claim is true?"
 
-Run `make multinode-up && make experiment-partial-opensearch`. It starts a
-three-node cluster, stops a data node, measures, restarts it, and **fails loudly
-if the incomplete responses came with errors attached**. The pass condition is
-written into the script, not into the prose.
+Run `make experiment-partial-local` for the in-process version, or
+`make multinode-up && make experiment-partial-opensearch` to stop a real data
+node in a three-node cluster. Both **fail loudly** unless some configuration
+produced incomplete responses with zero errors, and unless every error that did
+appear is accounted for by a deadline expiry. The pass condition is written into
+the script, not into the prose, and the raw artifacts are in
+[`docs/experiments/`](docs/experiments/README.md).
+
+Both have been executed. On the real cluster a stopped data node produced 5,000
+incomplete responses with 0 errors and the cluster then recovered; in-process, 5
+of 9 configurations did the same. Raw artifacts are committed, so the numbers can
+be checked rather than believed.
 
 ### "Why 64-dimensional embeddings? That's tiny."
 
@@ -388,8 +459,11 @@ is where they should stay until they are measured.
 > data as two counters that were identical across four runs. I separated them,
 > put the definition in one place so the two backends can't disagree, and wrote
 > a test that fails if either case stops being representable. Then I ran the
-> experiment that actually needed it: stop a data node in a three-node cluster
-> and confirm the searches come back incomplete with zero errors.
+> experiment that actually needed it: take a shard out and confirm the searches
+> come back incomplete with zero errors. Five thousand searches, all incomplete,
+> none carrying an error. Where load also blew the deadline, the error count
+> matched the deadline count exactly — so every error was a timeout and none was
+> a missing shard.
 >
 > The repository also has a from-scratch WAL, LSM engine, Raft, and sharding.
 > Those are a learning track — the product uses OpenSearch, and I keep the two

@@ -4,21 +4,36 @@
 Shared by scripts/partial-results-local.sh and
 scripts/partial-results-opensearch.sh so both apply the same rule.
 
-The rule is a like-for-like comparison, per (query class, concurrency)
-configuration, because a concurrency sweep will find the point where the
-offered load alone saturates the system. At that point the baseline itself
-returns deadline-driven incomplete responses, and asking whether a *fault*
-caused incompleteness is unanswerable: everything is incomplete either way.
+Two things make a naive check wrong, and both were observed in real runs:
 
-So:
+1. A concurrency sweep finds the load at which the system saturates on its own.
+   There the baseline itself returns deadline-driven incomplete responses, and
+   asking whether a *fault* caused incompleteness is unanswerable. Those
+   configurations are excluded and reported as excluded.
 
-  * Configurations where the baseline was clean are the ones the claim rests
-    on. There, the fault run must show incompleteness, and for an availability
-    fault it must show it with no errors at all.
-  * Configurations where the baseline was already saturated are excluded and
-    reported as excluded, not quietly dropped.
-  * If every configuration was saturated, the experiment proved nothing and
-    this exits non-zero.
+2. A fault plus enough offered load can exceed the deadline, so both failure
+   classes fire at once and the run becomes a *compound* of the two. On the
+   in-process backend this is amplified because removing a shard also removes
+   cacheability — only a complete, non-degraded response is cacheable — so the
+   fault run does real work on every query. That is correct behaviour, not a
+   defect, and must not be scored as a failure.
+
+What is actually checked, per configuration whose baseline was clean:
+
+  * the fault registered at all (incomplete > 0);
+  * it was classified as an availability loss (shard_unavailable > 0);
+  * and the core invariant from the coverage split:
+
+        api_error_responses == coverage_reasons['deadline']
+
+    Every error is accounted for by a deadline expiry, which means no
+    availability-classified response carried an error. If coverage and errors
+    were still welded together, every incomplete response would carry an error
+    and this equality would break immediately.
+
+And once globally: at least one configuration must be *pure* — incompleteness
+with no deadline and no error anywhere in it. That is the headline claim
+demonstrated in isolation, and without it the experiment proved nothing.
 
 Usage:
   verify_partial_results.py <directory> <baseline.json> <fault.json> [recovered.json]
@@ -62,9 +77,9 @@ def by_configuration(report):
 def describe(label, counters):
     reasons = ", ".join(f"{k}={v}" for k, v in sorted(counters["reasons"].items()))
     return (
-        f"{label:<22} completed={counters['completed']:<6} "
+        f"{label:<12} completed={counters['completed']:<6} "
         f"incomplete={counters['incomplete']:<6} degraded={counters['degraded']:<6} "
-        f"errors={counters['errors']:<6} cache_hits={counters['cache_hits']:<6} [{reasons}]"
+        f"errors={counters['errors']:<6} cached={counters['cache_hits']:<6} [{reasons}]"
     )
 
 
@@ -78,48 +93,44 @@ def main():
     recovered = by_configuration(load(directory, sys.argv[4])) if len(sys.argv) > 4 else None
 
     failures = []
-    clean, saturated = [], []
+    usable, saturated, pure, compound = [], [], [], []
 
     for key in sorted(baseline):
         if key not in fault:
             failures.append(f"{key} present in baseline but not in the fault run")
             continue
         if baseline[key]["incomplete"] == 0 and baseline[key]["errors"] == 0:
-            clean.append(key)
+            usable.append(key)
         else:
             saturated.append(key)
 
-    print("Per-configuration comparison\n")
-    for key in sorted(baseline):
-        marker = "saturated" if key in saturated else "usable"
-        print(f"[{marker}] query_class={key[0]!r} concurrency={key[1]}")
-        print("  " + describe("baseline", baseline[key]))
-        print("  " + describe("fault", fault[key]))
-        if recovered and key in recovered:
-            print("  " + describe("recovered", recovered[key]))
-        print()
-
-    if not clean:
-        failures.append(
-            "every configuration saturated under its own offered load, so no "
-            "configuration can attribute incompleteness to the injected fault; "
-            "lower the concurrency sweep or raise the deadline"
-        )
-
-    # The claim rests only on configurations where the baseline was clean.
-    for key in clean:
+    for key in usable:
         counters = fault[key]
+        deadlines = counters["reasons"].get("deadline", 0)
+
         if counters["incomplete"] == 0:
             failures.append(f"{key}: the fault produced no incomplete responses")
-        if counters["errors"] != 0:
-            failures.append(
-                f"{key}: the fault produced {counters['errors']} error responses; "
-                "an unavailable shard is not an error"
-            )
-        if counters["degraded"] != 0:
-            failures.append(f"{key}: the fault produced {counters['degraded']} degraded responses")
         if counters["reasons"].get("shard_unavailable", 0) == 0:
-            failures.append(f"{key}: reasons were {counters['reasons']}, expected shard_unavailable")
+            failures.append(
+                f"{key}: no response was classified shard_unavailable; reasons were {counters['reasons']}"
+            )
+        # The invariant the coverage split exists to guarantee.
+        if counters["errors"] != deadlines:
+            failures.append(
+                f"{key}: {counters['errors']} error responses but {deadlines} deadline "
+                "expiries — an availability loss must not carry an error"
+            )
+        if counters["degraded"] != deadlines:
+            failures.append(
+                f"{key}: {counters['degraded']} degraded responses but {deadlines} deadline "
+                "expiries — degradation must be accounted for by the deadline"
+            )
+
+        if deadlines == 0 and counters["errors"] == 0:
+            pure.append(key)
+        else:
+            compound.append(key)
+
         if recovered is not None:
             after = recovered.get(key)
             if after and (after["incomplete"] or after["errors"]):
@@ -127,6 +138,38 @@ def main():
                     f"{key}: still degraded after recovery "
                     f"(incomplete={after['incomplete']} errors={after['errors']})"
                 )
+
+    print("Per-configuration comparison\n")
+    for key in sorted(baseline):
+        if key in saturated:
+            marker = "saturated"
+        elif key in pure:
+            marker = "pure"
+        elif key in compound:
+            marker = "compound"
+        else:
+            marker = "unscored"
+        print(f"[{marker}] query_class={key[0]!r} concurrency={key[1]}")
+        print("  " + describe("baseline", baseline[key]))
+        if key in fault:
+            print("  " + describe("fault", fault[key]))
+        if recovered and key in recovered:
+            print("  " + describe("recovered", recovered[key]))
+        print()
+
+    if not usable:
+        failures.append(
+            "every configuration saturated under its own offered load, so none can "
+            "attribute incompleteness to the injected fault; lower the concurrency "
+            "sweep, shrink the corpus, or raise the deadline"
+        )
+    elif not pure:
+        failures.append(
+            "no configuration isolated the availability path: every one that "
+            "registered the fault also expired the deadline, so 'partial results "
+            "with no error' was never demonstrated on its own. Lower the "
+            "concurrency sweep or raise the deadline."
+        )
 
     if saturated:
         print(
@@ -140,6 +183,23 @@ def main():
             "  the load-sweep table, not in the partial-results claim.\n"
         )
 
+    if compound:
+        print(
+            f"{len(compound)} configuration(s) are compound: the fault registered and "
+            "the deadline also expired."
+        )
+        for key in compound:
+            print(f"  - query_class={key[0]!r} concurrency={key[1]}")
+        print(
+            "  Expected rather than wrong: a fault plus enough offered load can exceed\n"
+            "  the budget, and then both classes fire at once. On the in-process backend\n"
+            "  the usual cause is lost cacheability — only a complete, non-degraded\n"
+            "  response is cacheable, so the fault run does real work on every query. On\n"
+            "  OpenSearch it is normally load alone. Either way every error here is\n"
+            "  accounted for by a deadline expiry, never by the missing shard.\n"
+            "  Quote the pure configurations for the availability claim.\n"
+        )
+
     if failures:
         print("FAILED:")
         for failure in failures:
@@ -147,9 +207,14 @@ def main():
         return 1
 
     print(
-        f"OK: across {len(clean)} configuration(s) with a clean baseline, the fault "
-        "produced incomplete responses with zero errors."
+        f"OK: {len(pure)} configuration(s) isolated the availability path — incomplete "
+        "responses, zero errors, classified shard_unavailable."
     )
+    if compound:
+        print(
+            f"    {len(compound)} compound configuration(s) held the invariant too: "
+            "every error was a deadline expiry, never an availability loss."
+        )
     print("Availability-driven incompleteness is separately observable from deadline expiry.")
     return 0
 
