@@ -152,9 +152,9 @@ partial results from an unreachable shard. See the correction above.
 
 Latency is reported as histograms and percentiles. Averages are not used to make SLO claims. Merge-window measurements run indexing and querying concurrently while segment-merge duration is recorded beside query p99.
 
-## Finding: segment count dominates tail latency
+## Observation: segment count and tail latency (under test)
 
-This is the strongest result in the repository and it was not designed. Across
+This is the most interesting observation in the repository, and it was not designed. Across
 the 1,000,008-document corpus, as the index was compacted:
 
 | Index state | Primary segments | p50 | p99 | Backend | n |
@@ -164,22 +164,27 @@ the 1,000,008-document corpus, as the index was compacted:
 | After explicit force-merge | 3 | 18.00ms | 49.06ms | opensearch | 1 |
 
 **p99 fell roughly 4×. p50 moved by a couple of milliseconds and not
-monotonically.** Segment count is dominating tail latency and almost nothing
-else. The mechanism is straightforward: a search visits every segment, so more
+monotonically.** The likely explanation is segment count. The mechanism is straightforward: a search visits every segment, so more
 segments means more opportunities for one of them to be slow, and the worst
 segment sets the tail.
 
-Two things must be said alongside it, or the finding is oversold:
+Three things must be said alongside it, or the observation is oversold:
 
 **The merge cost 360.390 seconds** of heavy disk and CPU work, and force-merge
 is one-way and not something to run continuously against a live index. "p99 can
 be cut 4×" is marketing. "p99 can be cut 4× for six minutes of merging you
 cannot repeat cheaply" is a result.
 
+**The runs cannot separate segment count from caching.** All three repeated
+one query (`distributed consensus`) 10,000 times with the Redis result cache
+enabled, and cache hits were not recorded. A cached response never reaches
+OpenSearch, so the tail may reflect cache behaviour as much as segment count.
+
 **These are three incidental points with n=1 each, not a curve.** They came from
 runs taken for other reasons. `make experiment-segments` turns this into a
 designed experiment: controlled segment counts read back from the `_segments`
-API, repeats with an IQR, the BM25 and kNN branch timings recorded separately so
+API, three query classes, repeats with an IQR, the result cache disabled
+(run with `REDIS_URL` unset), the BM25 and kNN branch timings recorded separately so
 the sensitivity can be attributed to one branch, and the merge cost captured per
 point. Until that has run with at least four distinct segment counts, the table
 above is an observation worth investigating rather than a measured relationship.

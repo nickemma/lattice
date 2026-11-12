@@ -3,10 +3,11 @@
 #
 # The four earlier benchmark runs contain a real finding that nobody designed:
 # across the 1M-document corpus, p99 moved 191ms -> 95ms -> 49ms as segments
-# were merged, while p50 barely moved (16.7 -> 24.7 -> 18.0). Segment count was
-# dominating tail latency and almost nothing else. That was an artifact of three
-# incidental runs, not an experiment: two points, no repeats, no attribution to
-# a branch, and no statement of what the merge cost.
+# were merged, while p50 barely moved (16.7 -> 24.7 -> 18.0). Segment count is
+# the likely explanation, but that came from three incidental runs of one query
+# with the Redis result cache enabled: no repeats, no cache-hit accounting, no
+# attribution to a branch, and no statement of what the merge cost. Run with
+# REDIS_URL unset so every query reaches OpenSearch.
 #
 # This script turns it into a designed experiment. It force-merges the index
 # down through a series of target segment counts, and at each target it records:

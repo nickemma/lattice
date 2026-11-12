@@ -1,266 +1,188 @@
-# LATTICE — Distributed Search & Retrieval Platform
+# LATTICE — Explicit Coverage in Deadline-Bounded Distributed Search
 
+[![CI](https://github.com/nickemma/lattice/actions/workflows/ci.yml/badge.svg)](https://github.com/nickemma/lattice/actions/workflows/ci.yml)
 ![Status](https://img.shields.io/badge/status-complete-brightgreen)
 ![Go](https://img.shields.io/badge/go-1.26-blue)
 ![Kubernetes](https://img.shields.io/badge/k8s-operator--managed-blue)
 ![License](https://img.shields.io/badge/license-APACHE-green)
 
-**LATTICE is a distributed-systems project that grew into a working hybrid search platform. All six build phases are complete.**
+**A hybrid search platform whose responses declare their own coverage. When shards fail to answer, LATTICE still returns results inside the deadline — and says exactly what is missing and why.**
 
-The project started with the hard foundations—durable storage, replication, consensus, and sharding—and ended with 1,000,008 documents indexed and searched behind a 200ms p99 deadline. The full path is exercised through Swagger UI, an interactive playground, automated integration tests, and deliberately destructive chaos experiments.
-
-[Architecture](#architecture) · [Build phases](#build-phases) · [Swagger and playground](#swagger-ui-and-playground) · [Definition of done](#definition-of-done) · [Walkthrough](docs/walkthrough.md) · [Status](#status)
+[Findings](#findings) · [Project status](#project-status) · [Architecture](#architecture) · [Quick start](#quick-start) · [Benchmarks](docs/benchmarks.md) · [Experiments](docs/experiments/README.md)
 
 ---
 
-## The engineering thesis
+## The question
 
-Search is the product surface. The real subject is what happens to data when machines fail, disagree, or disappear.
+Distributed search engines routinely return partial results when shards time out or drop out of rotation, and rarely say so. A caller cannot tell a thin result set from an incomplete one, and cannot tell a dead shard from a slow one.
 
-LATTICE had to:
+LATTICE asks what it takes to make that silence impossible: every response carries a coverage record answering two independent questions — *did every shard answer?* (`complete`) and *did anything fail?* (`degraded`) — plus a `reason` from a closed set. The same `complete: false` can mean a shard left rotation (`shard_unavailable`) or the deadline expired (`deadline`): the same symptom, a different event, a different fix.
 
-- keep acknowledged writes across crashes;
-- show how replication fails before consensus is introduced;
-- elect a leader and replicate safely with Raft;
-- rebalance sharded data without silently losing it;
-- ingest and search at least one million documents;
-- return partial search results when part of the cluster is unreachable; and
-- say so explicitly, in a form a program can act on.
+```json
+"coverage": {
+  "shards_queried": 6,
+  "shards_answered": 5,
+  "complete": false,
+  "degraded": false,
+  "reason": "shard_unavailable"
+}
+```
 
-The system never quietly turns a degraded answer into a seemingly complete one. Coverage answers **two independent questions** — *did every shard answer?* (`complete`) and *did anything fail?* (`degraded`) — plus a one-word `reason` from a closed set. That separation is what lets a client tell "a shard left rotation" apart from "the embedding service died" without parsing error strings, and it is verified by [`make experiment-partial-opensearch`](docs/experiments/README.md), which stops a real data node and fails if the resulting partial results came with errors attached.
+The four `complete` / `degraded` combinations and the full `reason` enum are in [`api.md`](api.md#coverage).
+
+---
+
+## Findings
+
+**1. Explicit coverage separates the two kinds of incompleteness on a real cluster.** With one data node of a three-node OpenSearch cluster stopped, 5,000 of 5,000 responses were marked incomplete with `reason: "shard_unavailable"`, zero errors and zero degraded responses; the cluster returned to baseline after recovery. Of nine load configurations, one isolated the shard fault cleanly, three were compound (deadline expiries alongside the shard fault, accounted for exactly), and five were excluded as saturated. Reproduce with `make experiment-partial-opensearch`; raw reports in [`docs/experiments/`](docs/experiments/README.md).
+
+**2. Segment count and tail latency — an observation under test.** Three incidental full-corpus runs (n = 1 each) showed p99 falling from 191.85 ms at 59 primary segments to 49.06 ms at 3, while p50 moved by about 1 ms. Those runs repeated one query with the Redis result cache enabled, before cache hits were recorded, so they cannot attribute the tail to segment count. `make experiment-segments` is the designed test: controlled segment counts read back from the `_segments` API, three query classes, repeated runs, merge cost per point, and the result cache disabled. Until it has run, this is an observation, not a measured relationship.
+
+---
+
+## Project status
+
+**Complete.** Scope is closed; no new phases are planned.
+
+| Evidence | Result |
+|---|---|
+| Corpus | 1,000,008 documents indexed and searchable |
+| Query latency at rest | 16.66 ms p50, 191.85 ms p99 at 1,514 QPS (concurrency 32, 200 ms deadline) |
+| Query latency during concurrent indexing | 24.69 ms p50, 95.55 ms p99 at 939 QPS |
+| Explicit coverage under shard loss | Verified on a real three-node OpenSearch cluster (Finding 1) |
+| Storage durability (learning track) | 100 / 100 `SIGKILL` crash-recovery runs lost no acknowledged write |
+| Raft (learning track) | Full suite passed 100 consecutive times; election time measured over 50 leader kills |
+| Snapshot restore | 25.0 s for 1,000,008 documents, restored count verified |
+| Deployment | Terraform + operator on kind passed publish → Kafka → indexer → hybrid search; Argo CD reconciles the worktree |
+| Operations | Threat model, runbook, benchmark report and one postmortem published |
+
+**Not claimed**, because the infrastructure to measure it does not exist here: results from a real embedding model (the development path uses a deterministic local embedder), a production-scale restore drill, a 30-day availability window, ingest freshness, and cost per million documents or queries. These are recorded as unmeasured rather than estimated.
+
+---
 
 ## Architecture
 
-The repository contains **two independent tracks**, and it is worth being precise about that before reading the diagram.
+The repository holds **two independent tracks**:
 
-- **A from-scratch learning track** (`pkg/`) — WAL, LSM storage, replication without consensus, Raft, and sharding, built from first principles to understand how these systems work.
-- **An operated product track** (`internal/`, `cmd/`) — the search platform, which uses OpenSearch for indexing, sharding, and replication.
-
-**No data flows from the learning track into the query path.** The product imports only `pkg/lsm`, and only for the local development backend; `pkg/raft`, `pkg/shard`, `pkg/replication`, and `pkg/wal` are not on the request path. The foundations exist so that what OpenSearch does is understood rather than magical — not to replace it. Wiring them in would be weeks of work that changes no measurement.
-
-All benchmark numbers in this repository come from the product track, and every table states which backend produced it.
+- **Product track** (`internal/`, `cmd/`) — the search platform. OpenSearch provides indexing, sharding and replication; LATTICE provides the ingest pipeline, the query path, deadlines, fusion and coverage. Every benchmark number comes from this track.
+- **Learning track** (`pkg/`) — WAL, LSM storage with MVCC, replication without consensus, Raft and consistent-hash sharding, built from first principles to understand what OpenSearch does. **None of it is on the query path.** `pkg/raft` is a deterministic in-process cluster under logical time — repeatable by design, not a networked cluster.
 
 ```mermaid
 flowchart TB
     subgraph FOUNDATIONS["Learning track: from-scratch foundations (not on the query path)"]
-        WAL["WAL<br/>crash recovery"] --> LSM["LSM storage<br/>memtable · SSTable · compaction"]
+        WAL["WAL<br/>crash recovery"] --> LSM["LSM storage<br/>memtable · SSTable · compaction · MVCC"]
         LSM --> KV["Replicated KV<br/>without consensus"]
         KV --> RAFT["Raft<br/>leader · log · snapshots"]
         RAFT --> SHARD["Sharded Raft store<br/>consistent hashing · rebalancing"]
     end
 
-    subgraph PRODUCT["Product track: LATTICE on Kubernetes (everything measured)"]
-        SRC["Sources<br/>Wikipedia · APIs · CDC"] --> KAFKA{{"Kafka<br/>ingest stream"}}
-        KAFKA --> IDX["Go indexer<br/>batching · backpressure · DLQ"]
-        IDX --> EMB["Embedding service<br/>batched inference"]
+    subgraph PRODUCT["Product track: LATTICE (everything measured)"]
+        KAFKA{{"Kafka<br/>ingest stream"}} --> IDX["Go indexer<br/>batching · backpressure · DLQ"]
+        IDX --> EMB["Embedder"]
         EMB --> IDX
         IDX --> OS[("OpenSearch<br/>BM25 + kNN vectors")]
-
-        CLIENT["Client"] --> SWAGGER["Swagger UI<br/>OpenAPI contract"]
-        CLIENT --> PLAY["Playground<br/>seed · search · failure drills"]
-        SWAGGER --> API["Go API<br/>query service + control endpoints"]
-        PLAY --> API
+        CLIENT["Client · Swagger · playground"] --> API["Go query API"]
         API --> OS
         API --> CACHE[("Redis<br/>result cache")]
         API --> RESP["Results<br/>RRF · deadlines · coverage · timings"]
-
-        OS --> SNAP[("S3\nsnapshots")]
+        OS --> SNAP[("Snapshots")]
     end
 
     TF["Terraform"] -. provisions .-> K8S["Kubernetes"]
+    ARGO["Argo CD"] -. reconciles .-> K8S
     K8S -. runs .-> OS
     K8S -. runs .-> API
-    ARGO["Argo CD"] -. reconciles .-> K8S
-    OBS["Prometheus · Grafana"] -. observes .-> OS
-    OBS -. observes .-> API
     CHAOS["Chaos suite"] -. kills · partitions · overloads .-> OS
-    CHAOS -. kills · partitions · overloads .-> API
 ```
 
-The two subgraphs do not touch. That is not an omission in the diagram: the learning track and the product track are separate programs that share a repository, and the product's sharding, replication, and consensus are OpenSearch's, not `pkg/`'s.
+**Ingest.** Producer → Kafka → Go indexer → batched embedding → OpenSearch `_bulk` → per-document result inspection → offset commit or dead-letter queue. Delivery is at-least-once with deterministic document IDs; offsets advance only after a document is indexed or dead-lettered.
 
-The custom WAL, LSM, Raft, and sharding packages are deliberately separable and readable on their own. One precision about `pkg/raft`: it is a **deterministic in-process cluster** — the nodes are objects in a single program exchanging messages through a queue under logical time. That is a legitimate and standard way to build and test a consensus algorithm, because it makes the tests repeatable in a way networked tests are not. It is **not** a networked cluster, and its election measurements are in logical ticks rather than milliseconds.
+**Query.** Client → query API → BM25 and vector branches under one deadline → reciprocal rank fusion → partial-result collection → results with coverage and per-stage timings. A partial answer inside the deadline is preferred to a late complete one, provided the client can see exactly what happened.
 
-## End-to-end request flow
+---
 
-### Ingest
+## Quick start
 
-```text
-Document producer
-    → Kafka topic
-    → Go indexer
-    → batched embedding
-    → OpenSearch _bulk request
-    → per-document result inspection
-    → offset commit or dead-letter queue
+Prerequisites: Go 1.26, Docker with Compose.
+
+```bash
+git clone https://github.com/nickemma/lattice.git
+cd lattice
+
+# Full stack: Kafka, indexer, OpenSearch, Redis, API
+make compose-up
+make smoke-compose          # in a second terminal: publish → index → search
+
+# Publish and search through the API
+curl -fsS -X POST http://localhost:8080/v1/documents \
+  -H 'content-type: application/json' \
+  -d '{"id":"demo-001","title":"Durable search","body":"LATTICE combines keyword and semantic retrieval."}'
+curl -fsS -G http://localhost:8080/v1/search --data-urlencode 'q=semantic retrieval'
+
+make compose-down
 ```
 
-The indexer uses at-least-once delivery and deterministic document IDs. Offsets advance only after a document is indexed or placed in the DLQ. Transient rejections cause consumer backpressure; permanent failures do not block the partition.
+Swagger UI is at `/docs` and the playground at `/playground`. [`docs/walkthrough.md`](docs/walkthrough.md) covers ingest failure, replay, partial results, operations and the Kubernetes path.
 
-### Query
+**Reproduce the evidence**
 
-```text
-Client
-    → Swagger UI, playground, or API client
-    → query API
-    → BM25 branch + vector branch under one deadline
-    → reciprocal rank fusion
-    → partial-result collection
-    → results + coverage + stage timings
+```bash
+make test test-integration test-chaos    # unit, integration and chaos tests
+make wal-crash-evidence                  # 100 SIGKILL crash-recovery runs
+make election-evidence                   # 50 leader kills, election distribution
+make experiment-partial-opensearch       # Finding 1 on a real cluster
+make experiment-segments                 # Finding 2 (run with REDIS_URL unset)
 ```
 
-Example response shape:
-
-```json
-{
-  "results": [],
-  "coverage": {
-    "shards_queried": 6,
-    "shards_answered": 5,
-    "complete": false,
-    "degraded": false,
-    "reason": "shard_unavailable"
-  },
-  "timings_ms": {
-    "parse": 0.4,
-    "bm25": 22.1,
-    "vector": 41.7,
-    "fuse": 1.8
-  }
-}
-```
-
-Read that as: a shard is out of rotation, nothing errored, and the results returned are real but partial. Had the deadline expired instead, `degraded` would be `true` and `reason` would be `deadline` — the same `complete: false`, a different event, a different fix. The four `complete`/`degraded` combinations and the full `reason` enum are in [`api.md`](api.md#coverage).
-
-Partial results inside the deadline are preferable to a late complete response, provided the client can see exactly what happened.
-
-## Build phases
-
-The project was built in six phases over weeks 11–26. Each phase produced a working artifact, a failure experiment, and measurements that became evidence for the next phase. All six are complete.
-
-| Phase | Focus | Built and proven | Status |
-|---|---|---|---|
-| 1 · Weeks 11–14 | Durable single-node storage | WAL, memtable, SSTables, compaction, recovery, MVCC; survived repeated `kill -9` runs | Complete |
-| 2 · Weeks 15–17 | Replication without consensus | Replicated KV store; demonstrates stale reads, split-brain leaders, and divergent writes | Complete |
-| 3 · Weeks 18–21 | Consensus | Raft leader election, persistence, replication, commit rules, snapshots, and log compaction | Complete |
-| 4 · Weeks 22–23 | Sharding | Consistent hashing, quorum reads/writes, live rebalancing, and migration-latency measurements | Complete |
-| 5 · Weeks 24–25 | Search product | Kafka indexer, embeddings, OpenSearch hybrid search, Go query API, Kubernetes, Terraform, Argo CD, Swagger, and playground | Complete |
-| 6 · Week 26 | Chaos and hardening | Observability, SLOs, node loss, disk pressure, partitions, certificate expiry, restore drill, security hardening, and postmortem | Complete |
-
-The detailed phase-by-phase plan and definition of done are in [`docs/lattice.md`](docs/lattice.md).
-
-## Swagger UI and playground
-
-The product is testable without writing a client application:
-
-- **Swagger UI:** interactive OpenAPI documentation for health, document publishing, search, reindex, and operational endpoints.
-- **Playground:** a guided browser workflow for loading sample documents, running keyword and semantic searches, inspecting coverage and timings, and triggering safe local failure drills.
-- **CLI and curl:** every playground action has a reproducible command for automation and CI.
-
-The local surface is:
-
-| Surface | Purpose |
-|---|---|
-| `/docs` | Swagger UI |
-| `/openapi.yaml` | OpenAPI specification |
-| `/playground` | Interactive end-to-end testing |
-| `/healthz` | Liveness |
-| `/readyz` | Dependency readiness |
-| `/metrics` | Prometheus metrics |
-| `:19091/metrics` in Compose | Indexer lag, batch, retry, and DLQ metrics |
-| `/v1/search` | Hybrid search |
-| `/v1/documents` | Playground-friendly document publishing into the ingest path |
-
-`/v1/documents` is a convenience adapter for local testing. Production ingestion still exercises Kafka, batching, embeddings, backpressure, offsets, and the DLQ.
-
-Follow [`docs/walkthrough.md`](docs/walkthrough.md) for the complete test journey.
-The complete route-level contract is in [`api.md`](api.md). No real secrets
-are checked into the repository: Compose uses development-only inline
-configuration, while Terraform creates Kubernetes Secrets from supplied
-variables. See [`.env.example`](.env.example) and the walkthrough for the
-configuration boundary.
-
-For a Kubernetes deployment with API TLS and OpenSearch mTLS, render the
-required-secret overlay in [`deploy/k8s-secure`](deploy/k8s-secure). The base
-manifests remain suitable for a local development cluster; the secure overlay
-requires certificates and explicit trust roots before it can start.
-
-## Definition of done
-
-Every criterion below is met, and each is stated with the evidence behind it rather than asserted on its own.
-
-- [x] **A storage engine loses no acknowledged write across one hundred crash-recovery runs** — 100/100 subprocess `SIGKILL` recoveries passed (`make wal-crash-evidence`).
-- [x] **Raft passes its full test suite one hundred consecutive times** — 100/100 passed.
-- [x] **Leader-election time is measured across fifty leader kills** — 50 trials, 3 logical election ticks each ([`docs/election-distribution.csv`](docs/election-distribution.csv)).
-- [x] **One million documents are indexed and searchable with a stated p99** — 1,000,008 documents; 16.66ms p50, 191.85ms p99 at 1,514 QPS.
-- [x] **p99 is measured during an active segment merge, not only at rest** — 24.69ms p50 / 95.55ms p99 during concurrent indexing; 49.06ms p99 during an explicit force-merge (59 → 3 primary segments).
-- [x] **Unreachable shards produce partial results with explicit coverage** — a data node stopped in a three-node OpenSearch cluster produced incomplete responses with `reason: "shard_unavailable"` and zero errors, distinguishable from deadline expiry ([`make experiment-partial-opensearch`](docs/experiments/README.md)). An in-process controlled comparison runs the same three scenarios with injected faults.
-- [x] **Swagger UI and the playground exercise the same API contract used by automated tests** — one OpenAPI spec in [`api/`](api), one contract in [`api.md`](api.md).
-- [x] **Terraform and Argo CD rebuild and deploy the system without manual cluster mutation** — `make smoke-argocd` reconciles the worktree through Argo CD in a disposable kind cluster; a fresh Terraform/operator kind deployment passed publish → Kafka/indexer → hybrid search.
-- [x] **Chaos behavior is documented for every injected failure** — [`chaos/`](chaos/README.md).
-- [x] **Snapshot restore is timed and included in the runbook and benchmark report** — 25.016s for 1,000,008 documents, restored count verified.
-- [x] **`docs/THREAT_MODEL.md`, `docs/RUNBOOK.md`, `docs/benchmarks.md`, and one postmortem are published** — see [Documentation](#documentation).
-
-## Service targets
-
-| Property | Target | Measured |
-|---|---|---|
-| Corpus | At least 1,000,000 documents | 1,000,008 searchable documents |
-| Query latency | p99 below 200ms; p99 below 400ms during merge | 191.85ms at rest; 49.06ms during force-merge |
-| Ingest freshness | p95 below 60 seconds | Not measured |
-| Query availability | 99.9% over 30 days | Not measured — no 30-day production window exists |
-| Durability | No silent loss: indexed or DLQ | Verified in the Compose acceptance flow |
-| Single-node recovery | Cluster green within 5 minutes | Not measured |
-
-Cost per million documents and per million queries remain unmeasured, and are stated as unmeasured rather than estimated. No benchmark cell in this repository is filled with an estimate; the full log is in [`docs/benchmarks.md`](docs/benchmarks.md).
+---
 
 ## Repository layout
 
 ```text
 lattice/
-├─ cmd/{indexer,latticectl,latticebench}/       query service is `cmd/`
-├─ internal/
-│  ├─ ingest/  ├─ search/  ├─ server/
-│  └─ providers/{opensearch,kafka}/
-├─ pkg/          learning track — not on the query path
-│  ├─ wal/       durable write-ahead log
-│  ├─ lsm/       storage engine
-│  ├─ shard/     consistent hashing
-│  └─ raft/      consensus module (deterministic, in-process)
-├─ api/           OpenAPI specification
-├─ deploy/        Compose, Kubernetes, Terraform, and Argo CD
-├─ bench/         load and recovery tests
-├─ chaos/         failure experiments
-└─ docs/
+├─ cmd/            query service, indexer, latticectl, latticebench
+├─ internal/       ingest, search, server, providers (OpenSearch, Kafka, embedding)
+├─ pkg/            learning track — wal, lsm, replication, raft, shard (not on the query path)
+├─ api/            OpenAPI specification
+├─ deploy/         Compose, Kubernetes, Terraform, Argo CD
+├─ bench/          load and recovery tests
+├─ chaos/          failure experiments
+├─ scripts/        smoke tests and experiments
+└─ docs/           benchmarks, experiments, architecture, runbook, threat model
 ```
+
+---
 
 ## Documentation
 
 | Document | Contents |
 |---|---|
-| [`docs/lattice.md`](docs/lattice.md) | Authoritative six-phase build plan and definition of done |
+| [`docs/benchmarks.md`](docs/benchmarks.md) | Every measurement, its conditions, and what remains unmeasured |
+| [`docs/experiments/README.md`](docs/experiments/README.md) | Designed experiments, pass conditions and raw artifacts |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Runtime architecture and failure boundaries |
-| [`docs/walkthrough.md`](docs/walkthrough.md) | End-to-end Swagger, playground, CLI, and chaos testing walkthrough |
-| [`api.md`](api.md) | Complete HTTP API reference and request/response examples |
-| [`docs/RPD.md`](docs/RPD.md) | Product requirements and acceptance criteria |
 | [`docs/ENGINEERING.md`](docs/ENGINEERING.md) | Search-platform design and operational decisions |
-| [`docs/RUNBOOK.md`](docs/RUNBOOK.md) | Incident response and restore procedures |
-| [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) | Assets, trust boundaries, threats, and controls |
-| [`layman.md`](layman.md) | Plain-language explanation, and the answers to the hard questions |
-| [`docs/benchmarks.md`](docs/benchmarks.md) | Measured evidence and remaining capacity, cost, and restore work |
-| [`docs/experiments/README.md`](docs/experiments/README.md) | Designed experiments, their pass conditions, and raw artifacts |
-| [`docs/postmortem-compose-integration.md`](docs/postmortem-compose-integration.md) | Published Compose integration postmortem |
+| [`api.md`](api.md) | HTTP API reference, including the coverage contract |
+| [`docs/walkthrough.md`](docs/walkthrough.md) | End-to-end walkthrough |
+| [`docs/RUNBOOK.md`](docs/RUNBOOK.md) · [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md) | Operations and security |
+| [`docs/postmortem-compose-integration.md`](docs/postmortem-compose-integration.md) | Published postmortem |
+| [`docs/lattice.md`](docs/lattice.md) | Original six-phase build plan and definition of done |
 
-## Status
+---
 
-**Complete.** All six phases shipped and every criterion in the [definition of done](#definition-of-done) is met.
+## Related repositories
 
-The end-to-end path is runnable today: WAL/LSM/MVCC storage, replication and Raft modules, sharding, hybrid search, Swagger UI, playground, snapshots, reindexing, metrics, and deterministic chaos tests. The production-shaped Compose path was measured with 1,000,008 searchable documents, full-corpus query percentiles, a concurrent-indexing merge window, an explicit force-merge window, and a timed native restore. A fresh Terraform/operator-backed kind deployment passed publish → Kafka/indexer → hybrid search, and `make smoke-argocd` reconciles the worktree through Argo CD in a disposable cluster. The raw reports live beside [`docs/benchmarks.md`](docs/benchmarks.md).
+[MERIDIAN](https://github.com/nickemma/meridian) — per-request consistency over a shared keyspace.
 
-What the project deliberately does **not** claim: measurements from a real embedding model, a restore drill against a production-scale scratch cluster, a 30-day availability window, and cost-per-million figures. Those need infrastructure this project does not run, and they are recorded as unmeasured rather than estimated.
+---
 
-The scope is closed. Issues and questions are welcome; new phases are not planned.
+## Author
 
-## License
+**Nicholas Emmanuel** · [@nickemma](https://github.com/nickemma)
 
-Apache-2.0. See [LICENSE](LICENSE).
+<div align="center">
+<a href="https://www.linkedin.com/in/techieemma/"><img src="https://img.shields.io/badge/linkedin-%23f78a38.svg?style=for-the-badge&logo=linkedin&logoColor=white" alt="Linkedin"></a>
+<a href="https://twitter.com/techieemma"><img src="https://img.shields.io/badge/Twitter-%23f78a38.svg?style=for-the-badge&logo=Twitter&logoColor=white" alt="Twitter"></a>
+<a href="https://github.com/nickemma/"><img src="https://img.shields.io/badge/github-%23f78a38.svg?style=for-the-badge&logo=github&logoColor=white" alt="Github"></a>
+<a href="https://techieemma.medium.com/"><img src="https://img.shields.io/badge/Medium-%23f78a38.svg?style=for-the-badge&logo=Medium&logoColor=white" alt="Medium"></a>
+<a href="mailto:nicholasemmanuel321@gmail.com"><img src="https://img.shields.io/badge/Gmail-f78a38?style=for-the-badge&logo=gmail&logoColor=white" alt="Gmail"></a>
+</div>

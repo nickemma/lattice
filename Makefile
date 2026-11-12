@@ -1,9 +1,12 @@
-.PHONY: dev run compose-up compose-down compose-logs multinode-up multinode-down smoke-local smoke-compose smoke-argocd test test-integration test-chaos wal-crash-evidence election-evidence bench-query bench-remote experiment-partial-local experiment-partial-opensearch experiment-segments reindex snapshot restore-drill chaos-k8s render-k8s render-k8s-secure
+.PHONY: dev run compose-up compose-down compose-logs multinode-up multinode-down smoke-local smoke-compose smoke-argocd test test-integration test-chaos wal-crash-evidence election-evidence bench-query bench-remote experiment-partial-local experiment-partial-opensearch experiment-segments reindex snapshot restore-drill chaos-k8s render-k8s render-k8s-secure check-docs
 
 GO_ENV=GOCACHE=$${LATTICE_GOCACHE:-/tmp/lattice-gocache}
 
-dev run:
+# Query service on :8080 with the durable local backend (no Docker needed).
+dev:
 	$(GO_ENV) go run ./cmd
+
+run: dev
 
 compose-up:
 	docker compose -f deploy/docker-compose.yaml up --build
@@ -100,3 +103,7 @@ render-k8s:
 
 render-k8s-secure:
 	kubectl kustomize deploy/k8s-secure >/tmp/lattice-k8s-secure.yaml
+
+# Fails on broken Markdown links/anchors and `make` commands naming missing targets.
+check-docs:
+	python3 scripts/check-docs.py

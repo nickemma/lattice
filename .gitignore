@@ -4,3 +4,6 @@ deploy/terraform/terraform.tfstate.*
 .env
 .env.*
 !.env.example
+
+# Local durable backend written by `make dev`
+.lattice-data/

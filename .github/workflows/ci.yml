@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go build, vet and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      # Includes the 100-run SIGKILL WAL crash-recovery evidence in pkg/wal.
+      - name: Unit tests
+        run: make test
+
+      # Live-stack tests skip themselves unless LATTICE_E2E_URL is set.
+      - name: Integration tests
+        run: make test-integration
+
+  docs:
+    name: Docs and scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Markdown links and make targets
+        run: make check-docs
+
+      - name: Shell script syntax
+        run: |
+          for script in scripts/*.sh chaos/*.sh; do
+            [ -f "$script" ] || continue
+            bash -n "$script"
+          done
+
+  deploy:
+    name: Deploy manifests and image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Render Kubernetes manifests
+        run: |
+          make render-k8s
+          make render-k8s-secure
+
+      - name: Validate Compose files
+        run: |
+          docker compose -f deploy/docker-compose.yaml config --quiet
+          docker compose -f deploy/docker-compose.multinode.yaml config --quiet
+
+      - name: Build container image
+        run: docker build --tag lattice:ci .

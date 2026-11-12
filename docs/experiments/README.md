@@ -261,9 +261,9 @@ make experiment-segments
 
 This started as an accident. Across the 1M-document runs, p99 moved
 191ms → 95ms → 49ms as segments were merged, while p50 barely moved
-(16.7 → 24.7 → 18.0). Segment count was dominating tail latency and almost
-nothing else — a real, explainable result sitting in three incidental JSON files
-with no experiment around it.
+(16.7 → 24.7 → 18.0). Segment count is the likely explanation, but those were
+three incidental runs of one query with the Redis result cache enabled, so
+they cannot attribute the tail to segments. Run this with `REDIS_URL` unset.
 
 The script force-merges down through a series of targets and, at each point,
 records:
